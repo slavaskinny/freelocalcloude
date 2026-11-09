@@ -3,8 +3,8 @@ setlocal EnableExtensions
 title Phone to PC File Server
 
 rem ================= SETTINGS =================
-set "SRV_USER=iphone"
-set "SRV_PASS=2009AZC"
+set "SRV_USER=adminlogin"
+set "SRV_PASS=adminpassword"
 set "SRV_PORT=8080"
 set "SRV_ROOT=D:\server"
 rem 1 = open the server to the internet (any Wi-Fi / mobile network), 0 = home Wi-Fi only
@@ -21,6 +21,18 @@ set "SRV_TAILSCALE=0"
 rem Option C: plain IP link like http://203.0.113.5:8080 (no domain, only for your own friends). 1 = use it
 rem   It tries to open the port on your router automatically (UPnP) and overrides the options above.
 set "SRV_DIRECT=0"
+
+rem ---- AUTOSTART WITH WINDOWS ----
+rem 0 = off. 1 = start when you sign in to Windows, the console window is visible.
+rem 2 = start when the PC boots, hidden, works even before anyone signs in.
+set "SRV_AUTOSTART=0"
+
+rem ---- TELEGRAM: post the connection link to a channel or chat ----
+rem The bot deletes its old link message and posts the new one, so the current link is always there.
+rem SRV_TG_TOKEN = bot token from BotFather. SRV_TG_CHAT = @channelname or a numeric id such as -1001234567890
+rem The bot must be an administrator of the channel with the right to post and delete messages.
+set "SRV_TG_TOKEN="
+set "SRV_TG_CHAT="
 rem Do not use these characters in the admin password: % ^ & ! "
 rem ============================================
 
@@ -43,6 +55,21 @@ rem ---- Firewall rule (local network) ----
 netsh advfirewall firewall delete rule name="PhoneFileServer" >nul 2>&1
 netsh advfirewall firewall add rule name="PhoneFileServer" dir=in action=allow protocol=TCP localport=%SRV_PORT% profile=any >nul 2>&1
 
+rem ---- Autostart with Windows ----
+if "%SRV_AUTOSTART%"=="1" goto as_logon
+if "%SRV_AUTOSTART%"=="2" goto as_boot
+schtasks /delete /tn "PhoneFileServer" /f >nul 2>&1
+echo Autostart: OFF
+goto as_done
+:as_logon
+schtasks /create /tn "PhoneFileServer" /tr "\"%BATFILE%\"" /sc onlogon /rl highest /delay 0000:20 /f >nul 2>&1
+if errorlevel 1 (echo Autostart: could not create the task) else (echo Autostart: ON, the server starts when you sign in to Windows)
+goto as_done
+:as_boot
+schtasks /create /tn "PhoneFileServer" /tr "\"%BATFILE%\"" /sc onstart /ru SYSTEM /rl highest /delay 0000:30 /f >nul 2>&1
+if errorlevel 1 (echo Autostart: could not create the task) else (echo Autostart: ON, the server starts when the PC boots, hidden)
+:as_done
+
 rem ---- Run embedded PowerShell/C# server ----
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$t=[IO.File]::ReadAllText($env:BATFILE,[Text.Encoding]::UTF8); $m='#'+'PS_START'; $i=$t.IndexOf($m,[StringComparison]::Ordinal); Invoke-Expression $t.Substring($i)"
 echo.
@@ -59,15 +86,20 @@ $ErrorActionPreference = 'Stop'
 $src = @'
 using System;
 using System.IO;
+using System.IO.Compression;
 using System.Net;
 using System.Text;
 using System.Threading;
 using System.Globalization;
 using System.Collections.Generic;
 using System.Security.Cryptography;
+using System.Drawing;
+using System.Drawing.Imaging;
 
 public class Account
 {
+    public string Id = "";
+    public string Name = "";
     public string Login;
     public string Folder;
     public byte[] Salt;
@@ -82,20 +114,92 @@ public class Session
 {
     public Account Acc;
     public DateTime Seen;
-    public string Ip;
+    public string Ip = "";
+}
+
+public class Msg
+{
+    public long Id;
+    public long Ts;
+    public string From = "";
+    public string Type = "text";   // text | file | dir
+    public string A = "";          // text, or path of the shared item in the sender's storage
+    public string B = "";          // item name
+    public string C = "";          // item size in bytes
+}
+
+public class Conv
+{
+    public string Key;
+    public string P1;
+    public string P2;
+    public List<Msg> List = new List<Msg>();
+}
+
+public class Sub
+{
+    public string AccId;
+    public string Token;
+    public string Endpoint;
+}
+
+public class Link
+{
+    public string Full;
+    public string Name;
+    public bool Zip;
+    public DateTime Exp;
+}
+
+public class ZipJob
+{
+    public string Id;
+    public string AccId;
+    public string Dir;
+    public string Name;
+    public string Tmp;
+    public int State;          // 0 working, 1 ready, 2 failed
+    public long Done;
+    public long Total;
+    public string Url = "";
+    public DateTime Exp;
+}
+
+public class Notif
+{
+    public long Id;
+    public string Title;
+    public string Body;
+    public string Url;
+    public string Tag;
 }
 
 public static class FileServer
 {
-    public static string PageAuth = "", PageMain = "", PageAdmin = "", PublicUrl = "";
+    public static string PageAuth = "", PageMain = "", PageAdmin = "", PublicUrl = "", SwJs = "";
+    public static string DirRecv = "Received", DirChat = "Chat", TxtUser = "User", TxtFile = "File", TxtDir = "Folder";
+    public static string TxtNotice = "Message", TxtApp = "Files";
     const string DefBad = "exe,msi,bat,cmd,scr,com,vbs,ps1,jar";
+    const string PushSubject = "mailto:push@example.com";
 
-    static string adminLogin, root, usersDir, accFile, cfgFile, logFile;
+    static string adminLogin, root, usersDir, chatDir, accFile, cfgFile, logFile, sessFile, subFile, readFile;
     static Dictionary<string, Account> accs = new Dictionary<string, Account>(StringComparer.OrdinalIgnoreCase);
+    static Dictionary<string, Account> byId = new Dictionary<string, Account>();
     static Dictionary<string, Session> sess = new Dictionary<string, Session>();
     static Dictionary<string, string> cfg = new Dictionary<string, string>();
     static Dictionary<string, List<DateTime>> hits = new Dictionary<string, List<DateTime>>();
     static List<string[]> logs = new List<string[]>();
+    static Dictionary<string, Conv> convs = new Dictionary<string, Conv>();
+    static Dictionary<string, long> reads = new Dictionary<string, long>();
+    static List<Sub> subs = new List<Sub>();
+    static Dictionary<string, List<Notif>> notifs = new Dictionary<string, List<Notif>>();
+    static Dictionary<int, byte[]> icons = new Dictionary<int, byte[]>();
+    static Dictionary<string, Link> links = new Dictionary<string, Link>();
+    static Dictionary<string, ZipJob> zjobs = new Dictionary<string, ZipJob>();
+    static string tmpDir;
+    static CngKey vapidKey = null;
+    static string vapidPub = "";
+    static long lastMsgId = 0;
     static object lk = new object();
     static DateTime started = DateTime.Now;
     static DateTime epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -103,15 +207,33 @@ public static class FileServer
     // ------------------------------------------------------------ start
     public static void Run(string au, string ap, int port, string r)
     {
+        try { ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; } catch { }
         root = r; adminLogin = au;
         usersDir = Path.Combine(r, "users");
+        chatDir = Path.Combine(r, "chat");
         Directory.CreateDirectory(usersDir);
+        Directory.CreateDirectory(chatDir);
+        tmpDir = Path.Combine(r, "tmp");
+        try
+        {
+            Directory.CreateDirectory(tmpDir);
+            foreach (string tf in Directory.GetFiles(tmpDir)) { try { File.Delete(tf); } catch { } }
+        }
+        catch { }
         accFile = Path.Combine(r, "accounts.txt");
         cfgFile = Path.Combine(r, "settings.txt");
         logFile = Path.Combine(r, "log.txt");
+        sessFile = Path.Combine(r, "sessions.txt");
+        subFile = Path.Combine(r, "push.txt");
+        readFile = Path.Combine(r, "reads.txt");
         LoadSettings();
         LoadAccounts();
         EnsureAdmin(au, ap);
+        LoadSessions();
+        LoadSubs();
+        LoadReads();
+        LoadChats();
+        InitVapid();
         CleanParts();
 
         HttpListener l = new HttpListener();
@@ -131,6 +253,43 @@ public static class FileServer
     static double ParseD(string s, double d) { double v; return double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? v : d; }
     static string V(Dictionary<string, string> f, string k) { string v; return f.TryGetValue(k, out v) ? v : ""; }
     static string Trunc(string s, int n) { return s.Length > n ? s.Substring(0, n) : s; }
+    // HttpListener decodes the query with the system code page; decode it as UTF-8 ourselves (Cyrillic names!)
+    static string QParam(string query, string k)
+    {
+        if (string.IsNullOrEmpty(query)) return "";
+        if (query[0] == '?') query = query.Substring(1);
+        foreach (string pair in query.Split('&'))
+        {
+            int i = pair.IndexOf('=');
+            string key = i < 0 ? pair : pair.Substring(0, i);
+            string val = i < 0 ? "" : pair.Substring(i + 1);
+            try
+            {
+                if (Uri.UnescapeDataString(key.Replace('+', ' ')) == k) return Uri.UnescapeDataString(val.Replace('+', ' '));
+            }
+            catch { }
+        }
+        return "";
+    }
+
+    static string QS(HttpListenerContext c, string k)
+    {
+        string raw = c.Request.RawUrl ?? "";
+        int i = raw.IndexOf('?');
+        return i < 0 ? "" : QParam(raw.Substring(i + 1), k);
+    }
+
+    // Content-Disposition with an ASCII fallback name and the real UTF-8 name
+    static string Disp(bool attach, string name)
+    {
+        StringBuilder a = new StringBuilder();
+        foreach (char ch in name)
+        {
+            if (ch < 32 || ch > 126 || ch == '"' || ch == '\\' || ch == '%' || ch == ';') a.Append('_');
+            else a.Append(ch);
+        }
+        return (attach ? "attachment" : "inline") + "; filename=\"" + a.ToString() + "\"; filename*=UTF-8''" + Uri.EscapeDataString(name);
+    }
 
     static string Q(string s)
     {
@@ -146,18 +305,26 @@ public static class FileServer
         return b.ToString();
     }
 
-    static string Esc(string s) { return s.Replace("\\", "\\\\").Replace("\r", "").Replace("\n", "\\n"); }
+    static string Esc(string s) { return s.Replace("\\", "\\\\").Replace("\r", "").Replace("\n", "\\n").Replace("\t", "\\t"); }
     static string Unesc(string s)
     {
         StringBuilder b = new StringBuilder();
         for (int i = 0; i < s.Length; i++)
         {
             char ch = s[i];
-            if (ch == '\\' && i + 1 < s.Length) { i++; b.Append(s[i] == 'n' ? '\n' : s[i]); }
+            if (ch == '\\' && i + 1 < s.Length)
+            {
+                i++;
+                if (s[i] == 'n') b.Append('\n');
+                else if (s[i] == 't') b.Append('\t');
+                else b.Append(s[i]);
+            }
             else b.Append(ch);
         }
         return b.ToString();
     }
+
+    static string B64u(byte[] b) { return Convert.ToBase64String(b).TrimEnd('=').Replace('+', '-').Replace('/', '_'); }
 
     static string RandHex(int n)
     {
@@ -173,6 +340,25 @@ public static class FileServer
         if (s == null || s.Length != 32) return false;
         foreach (char ch in s) { if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false; }
         return true;
+    }
+
+    // public account id: 8 digits, not related to the login
+    static string NewId()
+    {
+        byte[] b = new byte[4];
+        while (true)
+        {
+            using (RNGCryptoServiceProvider r = new RNGCryptoServiceProvider()) r.GetBytes(b);
+            uint v = BitConverter.ToUInt32(b, 0);
+            string id = (10000000L + (long)(v % 90000000u)).ToString();
+            lock (lk) { if (!byId.ContainsKey(id)) return id; }
+        }
+    }
+
+    static string DisplayName(Account a)
+    {
+        if (a.Name != null && a.Name.Length > 0) return a.Name;
+        return TxtUser + " " + a.Id.Substring(a.Id.Length - 4);
     }
 
     // ------------------------------------------------------------ settings
@@ -317,6 +503,13 @@ public static class FileServer
         return true;
     }
 
+    static string CleanName(string s)
+    {
+        StringBuilder b = new StringBuilder();
+        foreach (char ch in (s ?? "")) { if (ch >= ' ' && ch != '\u007f') b.Append(ch); }
+        return Trunc(b.ToString().Trim(), 30);
+    }
+
     static string FolderName(string login, string pw)
     {
         string n = login + "=" + pw;
@@ -344,7 +537,8 @@ public static class FileServer
                     sb.Append(a.Login).Append('\t').Append(Convert.ToBase64String(a.Salt)).Append('\t')
                       .Append(Convert.ToBase64String(a.Hash)).Append('\t').Append(a.Folder).Append('\t')
                       .Append(Dbl(a.Quota)).Append('\t').Append(a.Blocked).Append('\t')
-                      .Append(a.Created).Append('\t').Append(a.Last).Append("\r\n");
+                      .Append(a.Created).Append('\t').Append(a.Last).Append('\t')
+                      .Append(a.Id).Append('\t').Append(Esc(a.Name)).Append("\r\n");
                 }
                 string tmp = accFile + ".tmp";
                 File.WriteAllText(tmp, sb.ToString(), Encoding.UTF8);
@@ -357,26 +551,33 @@ public static class FileServer
 
     static void LoadAccounts()
     {
-        if (!File.Exists(accFile)) return;
-        foreach (string line in File.ReadAllLines(accFile, Encoding.UTF8))
+        bool changed = false;
+        if (File.Exists(accFile))
         {
-            string[] p = line.Split('\t');
-            if (p.Length < 8) continue;
-            try
+            foreach (string line in File.ReadAllLines(accFile, Encoding.UTF8))
             {
-                Account a = new Account();
-                a.Login = p[0];
-                a.Salt = Convert.FromBase64String(p[1]);
-                a.Hash = Convert.FromBase64String(p[2]);
-                a.Folder = p[3];
-                a.Quota = ParseD(p[4], -1);
-                a.Blocked = (int)ParseL(p[5], 0);
-                a.Created = ParseL(p[6], 0);
-                a.Last = ParseL(p[7], 0);
-                accs[a.Login] = a;
+                string[] p = line.Split('\t');
+                if (p.Length < 8) continue;
+                try
+                {
+                    Account a = new Account();
+                    a.Login = p[0];
+                    a.Salt = Convert.FromBase64String(p[1]);
+                    a.Hash = Convert.FromBase64String(p[2]);
+                    a.Folder = p[3];
+                    a.Quota = ParseD(p[4], -1);
+                    a.Blocked = (int)ParseL(p[5], 0);
+                    a.Created = ParseL(p[6], 0);
+                    a.Last = ParseL(p[7], 0);
+                    if (p.Length >= 10 && p[8].Length > 0 && !byId.ContainsKey(p[8])) { a.Id = p[8]; a.Name = Unesc(p[9]); }
+                    else { a.Id = NewId(); changed = true; }
+                    accs[a.Login] = a;
+                    byId[a.Id] = a;
+                }
+                catch { }
             }
-            catch { }
         }
+        if (changed) SaveAccounts();
     }
 
     static void EnsureAdmin(string au, string ap)
@@ -389,8 +590,10 @@ public static class FileServer
             {
                 a = new Account();
                 a.Login = au; a.Created = NowMs(); a.Folder = fn;
+                a.Id = NewId();
                 accs[au] = a;
-                // move files from the old single-user version, if present
+                byId[a.Id] = a;
+                // move files from the very first single-user version, if present
                 string legacy = Path.Combine(root, "uploads");
                 string np = Path.Combine(usersDir, fn);
                 try { if (Directory.Exists(legacy) && !Directory.Exists(np)) Directory.Move(legacy, np); } catch { }
@@ -419,18 +622,15 @@ public static class FileServer
     {
         try
         {
-            foreach (string d in Directory.GetDirectories(usersDir))
+            foreach (string f in Directory.GetFiles(usersDir, "*.part", SearchOption.AllDirectories))
             {
-                foreach (string f in Directory.GetFiles(d, "*.part"))
-                {
-                    try { if ((DateTime.Now - File.GetLastWriteTime(f)).TotalHours > 24) File.Delete(f); } catch { }
-                }
+                try { if ((DateTime.Now - File.GetLastWriteTime(f)).TotalHours > 24) File.Delete(f); } catch { }
             }
         }
         catch { }
     }
 
-    static string CreateUser(string login, string pw, double quota, int blocked, bool byAdmin)
+    static string CreateUser(string login, string pw, string name, double quota, int blocked, bool byAdmin)
     {
         if (!ValidLogin(login)) return "badlogin";
         if (!ValidPass(pw)) return "badpass";
@@ -444,21 +644,62 @@ public static class FileServer
             Account a = new Account();
             a.Login = login; a.Salt = NewSalt(); a.Hash = HashPw(pw, a.Salt);
             a.Folder = FolderName(login, pw);
+            a.Name = CleanName(name);
             a.Quota = quota; a.Blocked = blocked; a.Created = NowMs(); a.Last = 0;
+            a.Id = NewId();
             try { Directory.CreateDirectory(FolderPath(a)); } catch { return "folder"; }
             accs[login] = a;
+            byId[a.Id] = a;
             SaveAccounts();
         }
         return null;
     }
 
-    static void KillSessions(Account a)
+    // Changes login and/or password (the folder name contains both). Must be called inside lock(lk).
+    static string ApplyCreds(Account a, string newLogin, string newPw)
+    {
+        string curPw = CurPw(a);
+        bool loginChanged = !string.Equals(newLogin, a.Login, StringComparison.Ordinal);
+        bool pwChanged = newPw != curPw;
+        if (pwChanged && !ValidPass(newPw)) return "badpass";
+        if (loginChanged)
+        {
+            if (!ValidLogin(newLogin)) return "badlogin";
+            string lw = newLogin.ToLowerInvariant();
+            if (lw == "admin" || lw == "administrator") return "reserved";
+            Account other;
+            if (accs.TryGetValue(newLogin, out other) && !object.ReferenceEquals(other, a)) return "exists";
+        }
+        string newFolder = FolderName(newLogin, newPw);
+        if (newFolder != a.Folder)
+        {
+            string op = FolderPath(a), npth = Path.Combine(usersDir, newFolder);
+            try
+            {
+                if (Directory.Exists(op)) Directory.Move(op, npth);
+                else Directory.CreateDirectory(npth);
+            }
+            catch { return "folder"; }
+            a.Folder = newFolder;
+        }
+        if (loginChanged) { accs.Remove(a.Login); a.Login = newLogin; accs[newLogin] = a; }
+        if (pwChanged) { a.Salt = NewSalt(); a.Hash = HashPw(newPw, a.Salt); }
+        return null;
+    }
+
+    static void KillSessions(Account a, string keepToken)
     {
         lock (lk)
         {
             List<string> del = new List<string>();
-            foreach (KeyValuePair<string, Session> kv in sess) { if (object.ReferenceEquals(kv.Value.Acc, a)) del.Add(kv.Key); }
-            foreach (string k in del) sess.Remove(k);
+            foreach (KeyValuePair<string, Session> kv in sess)
+            {
+                if (object.ReferenceEquals(kv.Value.Acc, a) && kv.Key != keepToken) del.Add(kv.Key);
+            }
+            foreach (string k in del) { sess.Remove(k); notifs.Remove(k); }
+            subs.RemoveAll(delegate(Sub s) { return s.AccId == a.Id && s.Token != keepToken && !sess.ContainsKey(s.Token); });
+            SaveSessions();
+            SaveSubs();
         }
     }
 
@@ -470,40 +711,19 @@ public static class FileServer
             Account a;
             if (!accs.TryGetValue(target, out a)) return "nouser";
             if (IsAdmin(a)) return "adminfixed";
-            string curPw = CurPw(a);
             string newLogin = nl.Length > 0 ? nl : a.Login;
-            string newPw = np.Length > 0 ? np : curPw;
-            if (np.Length > 0 && !ValidPass(np)) return "badpass";
-            bool loginChanged = !string.Equals(newLogin, a.Login, StringComparison.Ordinal);
-            if (loginChanged)
-            {
-                if (!ValidLogin(newLogin)) return "badlogin";
-                string lw = newLogin.ToLowerInvariant();
-                if (lw == "admin" || lw == "administrator") return "reserved";
-                Account other;
-                if (accs.TryGetValue(newLogin, out other) && !object.ReferenceEquals(other, a)) return "exists";
-            }
-            string newFolder = FolderName(newLogin, newPw);
-            if (newFolder != a.Folder)
-            {
-                string op = FolderPath(a), npth = Path.Combine(usersDir, newFolder);
-                try
-                {
-                    if (Directory.Exists(op)) Directory.Move(op, npth);
-                    else Directory.CreateDirectory(npth);
-                }
-                catch { return "folder"; }
-                a.Folder = newFolder;
-            }
-            if (loginChanged) { accs.Remove(a.Login); a.Login = newLogin; accs[newLogin] = a; }
-            if (np.Length > 0) { a.Salt = NewSalt(); a.Hash = HashPw(np, a.Salt); KillSessions(a); }
+            string newPw = np.Length > 0 ? np : CurPw(a);
+            bool pwChanged = np.Length > 0 && np != CurPw(a);
+            string err = ApplyCreds(a, newLogin, newPw);
+            if (err != null) return err;
+            if (pwChanged) KillSessions(a, "");
             if (q == "def") a.Quota = -1;
             else if (q.Length > 0)
             {
                 double qv = ParseD(q, double.NaN);
                 if (!double.IsNaN(qv)) a.Quota = Math.Max(0.0, qv);
             }
-            if (bl == "1") { a.Blocked = 1; KillSessions(a); }
+            if (bl == "1") { a.Blocked = 1; KillSessions(a, ""); }
             else if (bl == "0") a.Blocked = 0;
             SaveAccounts();
         }
@@ -517,8 +737,11 @@ public static class FileServer
             Account a;
             if (!accs.TryGetValue(target, out a)) return "nouser";
             if (IsAdmin(a)) return "adminfixed";
-            KillSessions(a);
+            KillSessions(a, "");
+            subs.RemoveAll(delegate(Sub s) { return s.AccId == a.Id; });
+            SaveSubs();
             accs.Remove(a.Login);
+            byId.Remove(a.Id);
             string p = FolderPath(a);
             try
             {
@@ -547,14 +770,62 @@ public static class FileServer
         return (long)(g * 1073741824.0);
     }
 
-    static long Used(Account a)
+    static long DirSize(string dir)
     {
         long t = 0;
-        try { foreach (FileInfo f in new DirectoryInfo(FolderPath(a)).GetFiles()) t += f.Length; } catch { }
+        try { foreach (FileInfo f in new DirectoryInfo(dir).GetFiles("*", SearchOption.AllDirectories)) t += f.Length; } catch { }
         return t;
     }
 
+    static long Used(Account a) { return DirSize(FolderPath(a)); }
+
+    static bool DiskOk(long need)
+    {
+        try
+        {
+            long reserve = (long)(GetD("reserve", 2) * 1073741824.0);
+            DriveInfo di = new DriveInfo(Path.GetPathRoot(root));
+            return di.AvailableFreeSpace - need >= reserve;
+        }
+        catch { return true; }
+    }
+
     // ------------------------------------------------------------ sessions
+    static void SaveSessions()
+    {
+        lock (lk)
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder();
+                foreach (KeyValuePair<string, Session> kv in sess)
+                {
+                    long ms = (long)(kv.Value.Seen - epoch).TotalMilliseconds;
+                    sb.Append(kv.Key).Append('\t').Append(kv.Value.Acc.Id).Append('\t').Append(ms).Append("\r\n");
+                }
+                File.WriteAllText(sessFile, sb.ToString(), Encoding.UTF8);
+            }
+            catch { }
+        }
+    }
+
+    static void LoadSessions()
+    {
+        if (!File.Exists(sessFile)) return;
+        foreach (string line in File.ReadAllLines(sessFile, Encoding.UTF8))
+        {
+            string[] p = line.Split('\t');
+            if (p.Length < 3) continue;
+            Account a;
+            if (!byId.TryGetValue(p[1], out a)) continue;
+            DateTime seen = epoch.AddMilliseconds((double)ParseL(p[2], 0));
+            if ((DateTime.UtcNow - seen).TotalDays > 30) continue;
+            Session s = new Session();
+            s.Acc = a; s.Seen = seen;
+            sess[p[0]] = s;
+        }
+    }
+
     static Session GetSession(HttpListenerContext c)
     {
         Cookie ck = c.Request.Cookies["sid"];
@@ -579,7 +850,7 @@ public static class FileServer
         string t = RandHex(32);
         Session s = new Session();
         s.Acc = a; s.Seen = DateTime.UtcNow; s.Ip = Ip(c);
-        lock (lk) { sess[t] = s; a.Last = NowMs(); }
+        lock (lk) { sess[t] = s; a.Last = NowMs(); SaveSessions(); }
         bool https = c.Request.Headers["X-Forwarded-Proto"] == "https" && IPAddress.IsLoopback(c.Request.RemoteEndPoint.Address);
         c.Response.AppendHeader("Set-Cookie", "sid=" + t + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000" + (https ? "; Secure" : ""));
     }
@@ -591,11 +862,26 @@ public static class FileServer
         {
             string path = c.Request.Url.AbsolutePath;
             string m = c.Request.HttpMethod;
+            // the file name may follow in the path (so every browser names the saved file correctly)
+            if (path.StartsWith("/download/")) path = "/download";
+            else if (path.StartsWith("/zip/")) path = "/zip";
+            else if (path.StartsWith("/api/chat/item/")) path = "/api/chat/item";
 
             if (path == "/api/info" && m == "GET") { DoInfo(c); return; }
             if (path == "/api/login" && m == "POST") { DoLogin(c); return; }
             if (path == "/api/register" && m == "POST") { DoRegister(c); return; }
             if (path == "/logout") { DoLogout(c); return; }
+            if (path.StartsWith("/get/")) { DoGet(c, c.Request.Url.AbsolutePath); return; }
+            if (path == "/manifest.webmanifest") { SendBytes(c, 200, "application/manifest+json; charset=utf-8", Encoding.UTF8.GetBytes(Manifest()), "no-cache"); return; }
+            if (path == "/sw.js")
+            {
+                c.Response.AddHeader("Service-Worker-Allowed", "/");
+                SendBytes(c, 200, "text/javascript; charset=utf-8", Encoding.UTF8.GetBytes(SwJs), "no-cache");
+                return;
+            }
+            if (path == "/icon-192.png") { SendBytes(c, 200, "image/png", Icon(192), "public, max-age=86400"); return; }
+            if (path == "/icon-512.png") { SendBytes(c, 200, "image/png", Icon(512), "public, max-age=86400"); return; }
+            if (path == "/apple-touch-icon.png" || path == "/apple-touch-icon-precomposed.png") { SendBytes(c, 200, "image/png", Icon(180), "public, max-age=86400"); return; }
 
             Session s = GetSession(c);
             if (s == null)
@@ -607,18 +893,30 @@ public static class FileServer
             }
             Account a = s.Acc;
             bool admin = IsAdmin(a);
+            string token = c.Request.Cookies["sid"].Value;
 
             if (m == "POST" && c.Request.Headers["X-Req"] != "1") { Json(c, 403, "{\"err\":\"csrf\"}"); return; }
 
             if (path == "/" && m == "GET") Send(c, 200, "text/html", PageMain);
             else if (path == "/admin" && m == "GET") { if (admin) Send(c, 200, "text/html", PageAdmin); else Redirect(c, "/"); }
             else if (path == "/api/me") DoMe(c, a);
-            else if (path == "/api/ping") DoPing(c);
+            else if (path == "/api/ping") DoPing(c, a);
             else if (path == "/list" && m == "GET") DoList(c, a);
             else if (path == "/view" && m == "GET") DoFile(c, a, false);
             else if (path == "/download" && m == "GET") DoFile(c, a, true);
+            else if (path == "/zip" && m == "GET") DoZip(c, a);
+            else if (path == "/api/link" && m == "POST") DoLink(c, a);
+            else if (path == "/api/zip/start" && m == "POST") DoZipStart(c, a);
+            else if (path == "/api/zip/status" && m == "GET") DoZipStatus(c, a);
             else if (path == "/upload" && m == "POST") DoUpload(c, a);
             else if (path == "/delete" && m == "POST") DoDelete(c, a);
+            else if (path == "/api/fs/folders" && m == "GET") DoFolders(c, a);
+            else if (path == "/api/fs/mkdir" && m == "POST") DoMkdir(c, a);
+            else if (path == "/api/fs/rename" && m == "POST") DoRename(c, a);
+            else if (path == "/api/fs/move" && m == "POST") DoMove(c, a);
+            else if (path.StartsWith("/api/profile/") && m == "POST") DoProfile(c, a, path, token);
+            else if (path.StartsWith("/api/chat/")) DoChat(c, a, path, m);
+            else if (path.StartsWith("/api/push/")) DoPush(c, a, path, token);
             else if (path.StartsWith("/api/admin/"))
             {
                 if (!admin) Json(c, 403, "{\"err\":\"forbidden\"}");
@@ -651,6 +949,50 @@ public static class FileServer
             catch { }
         }
         return d;
+    }
+
+    // ------------------------------------------------------------ static assets
+    static string Manifest()
+    {
+        string t = Get("title", "");
+        if (t.Length == 0) t = TxtApp;
+        return "{\"name\":" + Q(t) + ",\"short_name\":" + Q(Trunc(t, 12)) + ",\"start_url\":\"/\",\"scope\":\"/\",\"display\":\"standalone\","
+            + "\"background_color\":\"#12151c\",\"theme_color\":\"#12151c\",\"icons\":["
+            + "{\"src\":\"/icon-192.png\",\"sizes\":\"192x192\",\"type\":\"image/png\"},"
+            + "{\"src\":\"/icon-512.png\",\"sizes\":\"512x512\",\"type\":\"image/png\"}]}";
+    }
+
+    static byte[] Icon(int size)
+    {
+        lock (lk)
+        {
+            byte[] b;
+            if (icons.TryGetValue(size, out b)) return b;
+            try
+            {
+                using (Bitmap bmp = new Bitmap(size, size))
+                {
+                    using (Graphics g = Graphics.FromImage(bmp))
+                    {
+                        g.Clear(Color.FromArgb(122, 162, 255));
+                        float s = (float)size;
+                        using (SolidBrush br = new SolidBrush(Color.FromArgb(12, 18, 32)))
+                        {
+                            g.FillRectangle(br, s * 0.22f, s * 0.28f, s * 0.27f, s * 0.12f);
+                            g.FillRectangle(br, s * 0.22f, s * 0.36f, s * 0.56f, s * 0.36f);
+                        }
+                    }
+                    using (MemoryStream ms = new MemoryStream())
+                    {
+                        bmp.Save(ms, ImageFormat.Png);
+                        b = ms.ToArray();
+                    }
+                }
+            }
+            catch { b = new byte[0]; }
+            icons[size] = b;
+            return b;
+        }
     }
 
     // ------------------------------------------------------------ public api
@@ -694,7 +1036,7 @@ public static class FileServer
         if (Count("rg:" + ip, 3600) >= 5) { Json(c, 200, "{\"err\":\"locked\"}"); return; }
         string u = V(f, "u").Trim(), p = V(f, "p");
         bool approve = Get("approve", "0") == "1";
-        string err = CreateUser(u, p, -1, approve ? 2 : 0, false);
+        string err = CreateUser(u, p, V(f, "n"), -1, approve ? 2 : 0, false);
         if (err != null) { Json(c, 200, "{\"err\":" + Q(err) + "}"); return; }
         Hit("rg:" + ip);
         Log("register", u, ip, approve ? "pending" : "");
@@ -708,7 +1050,17 @@ public static class FileServer
     static void DoLogout(HttpListenerContext c)
     {
         Cookie ck = c.Request.Cookies["sid"];
-        if (ck != null) { lock (lk) { sess.Remove(ck.Value); } }
+        if (ck != null)
+        {
+            lock (lk)
+            {
+                sess.Remove(ck.Value);
+                notifs.Remove(ck.Value);
+                subs.RemoveAll(delegate(Sub sb) { return sb.Token == ck.Value; });
+                SaveSessions();
+                SaveSubs();
+            }
+        }
         c.Response.AppendHeader("Set-Cookie", "sid=; Path=/; Max-Age=0");
         Redirect(c, "/");
     }
@@ -725,21 +1077,97 @@ public static class FileServer
     static void DoMe(HttpListenerContext c, Account a)
     {
         StringBuilder sb = new StringBuilder("{");
-        sb.Append("\"login\":").Append(Q(a.Login));
+        sb.Append("\"id\":").Append(Q(a.Id));
+        sb.Append(",\"name\":").Append(Q(a.Name));
+        sb.Append(",\"dn\":").Append(Q(DisplayName(a)));
+        sb.Append(",\"login\":").Append(Q(a.Login));
         sb.Append(",\"admin\":").Append(IsAdmin(a) ? "1" : "0");
         sb.Append(",\"used\":").Append(Used(a));
         sb.Append(",\"quota\":").Append(QuotaBytes(a));
         sb.Append(",\"title\":").Append(Q(Get("title", "")));
+        sb.Append(",\"chat\":").Append(Get("chat", "1") == "1" ? "1" : "0");
+        sb.Append(",\"dc\":").Append(Q(DirChat)).Append(",\"dr\":").Append(Q(DirRecv));
+        sb.Append(",\"u\":").Append(UnreadTotal(a));
         sb.Append(",\"nid\":").Append(Q(Get("nid", ""))).Append(",\"nt\":").Append(Q(Get("nt", "")));
         sb.Append("}");
         Json(c, 200, sb.ToString());
     }
 
-    static void DoPing(HttpListenerContext c)
+    static void DoPing(HttpListenerContext c, Account me)
     {
-        Json(c, 200, "{\"nid\":" + Q(Get("nid", "")) + ",\"nt\":" + Q(Get("nt", "")) + "}");
+        int unread = 0;
+        Msg newest = null;
+        if (Get("chat", "1") == "1")
+        {
+            lock (lk)
+            {
+                foreach (Conv cv in convs.Values)
+                {
+                    if (cv.P1 != me.Id && cv.P2 != me.Id) continue;
+                    long mark = ReadMark(me.Id, cv.Key);
+                    foreach (Msg m in cv.List)
+                    {
+                        if (m.Id > mark && m.From != me.Id)
+                        {
+                            unread++;
+                            if (newest == null || m.Id > newest.Id) newest = m;
+                        }
+                    }
+                }
+            }
+        }
+        string mj = "null";
+        if (newest != null)
+        {
+            Account snd;
+            lock (lk) { byId.TryGetValue(newest.From, out snd); }
+            mj = "{\"i\":" + newest.Id + ",\"p\":" + Q(newest.From) + ",\"n\":" + Q(snd != null ? DisplayName(snd) : "")
+                + ",\"k\":" + Q(newest.Type) + ",\"t\":" + Q(newest.Type == "text" ? Trunc(newest.A, 120) : newest.B) + "}";
+        }
+        Json(c, 200, "{\"nid\":" + Q(Get("nid", "")) + ",\"nt\":" + Q(Get("nt", "")) + ",\"u\":" + unread + ",\"m\":" + mj + "}");
     }
 
+    static void DoProfile(HttpListenerContext c, Account me, string path, string token)
+    {
+        Dictionary<string, string> f = ReadForm(c);
+        string ip = Ip(c);
+        if (path == "/api/profile/name")
+        {
+            lock (lk) { me.Name = CleanName(V(f, "name")); SaveAccounts(); }
+            Json(c, 200, "{\"ok\":1,\"dn\":" + Q(DisplayName(me)) + "}");
+            return;
+        }
+        if (path == "/api/profile/logout-all")
+        {
+            KillSessions(me, token);
+            Json(c, 200, "{\"ok\":1}");
+            return;
+        }
+        if (path == "/api/profile/login" || path == "/api/profile/pass")
+        {
+            if (IsAdmin(me)) { Json(c, 200, "{\"err\":\"adminfixed\"}"); return; }
+            if (Count("pf:" + me.Id, 600) >= 8) { Json(c, 200, "{\"err\":\"locked\"}"); return; }
+            string cur = V(f, "cur");
+            bool ok;
+            lock (lk) { ok = CheckPw(me, cur); }
+            if (!ok) { Hit("pf:" + me.Id); Thread.Sleep(600); Json(c, 200, "{\"err\":\"wrongpass\"}"); return; }
+            string err;
+            lock (lk)
+            {
+                if (path == "/api/profile/login") err = ApplyCreds(me, V(f, "nl").Trim(), CurPw(me));
+                else err = ApplyCreds(me, me.Login, V(f, "np"));
+                if (err == null) SaveAccounts();
+            }
+            if (err != null) { Json(c, 200, "{\"err\":" + Q(err) + "}"); return; }
+            if (path == "/api/profile/pass") KillSessions(me, token);
+            Log(path == "/api/profile/login" ? "selflogin" : "selfpass", me.Id, ip, "");
+            Json(c, 200, "{\"ok\":1,\"login\":" + Q(me.Login) + "}");
+            return;
+        }
+        Json(c, 404, "{\"err\":\"nf\"}");
+    }
+
+    // ------------------------------------------------------------ files and folders
     static string Safe(string name)
     {
         if (name == null) return "file";
@@ -751,17 +1179,57 @@ public static class FileServer
         return name;
     }
 
+    static string NormRel(string rel)
+    {
+        if (string.IsNullOrEmpty(rel)) return "";
+        return string.Join("/", rel.Split(new char[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    static string JoinRel(string a, string b)
+    {
+        if (string.IsNullOrEmpty(a)) return b ?? "";
+        if (string.IsNullOrEmpty(b)) return a;
+        return a + "/" + b;
+    }
+
+    // Turns a relative path of the account's storage into a full path. Returns null for unsafe paths.
+    static string Resolve(Account a, string rel)
+    {
+        string cur = FolderPath(a);
+        if (string.IsNullOrEmpty(rel)) return cur;
+        foreach (string seg in rel.Split(new char[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (seg == "." || seg == "..") return null;
+            if (Safe(seg) != seg) return null;
+            cur = Path.Combine(cur, seg);
+        }
+        return cur;
+    }
+
     static string Unique(string dir, string name)
     {
         string full = Path.Combine(dir, name);
-        if (!File.Exists(full)) return full;
+        if (!File.Exists(full) && !Directory.Exists(full)) return full;
         string baseName = Path.GetFileNameWithoutExtension(name);
         string ext = Path.GetExtension(name);
         int n = 1;
         while (true)
         {
             full = Path.Combine(dir, baseName + " (" + n + ")" + ext);
-            if (!File.Exists(full)) return full;
+            if (!File.Exists(full) && !Directory.Exists(full)) return full;
+            n++;
+        }
+    }
+
+    static string UniqueDir(string dir, string name)
+    {
+        string full = Path.Combine(dir, name);
+        if (!File.Exists(full) && !Directory.Exists(full)) return full;
+        int n = 1;
+        while (true)
+        {
+            full = Path.Combine(dir, name + " (" + n + ")");
+            if (!File.Exists(full) && !Directory.Exists(full)) return full;
             n++;
         }
     }
@@ -812,13 +1280,26 @@ public static class FileServer
         return "other";
     }
 
-    static void DoList(HttpListenerContext c, Account a)
+    static string ListJson(string dir, string rel)
     {
-        DirectoryInfo di = new DirectoryInfo(FolderPath(a));
-        FileInfo[] files = di.Exists ? di.GetFiles() : new FileInfo[0];
+        DirectoryInfo di = new DirectoryInfo(dir);
+        DirectoryInfo[] dirs = di.GetDirectories();
+        FileInfo[] files = di.GetFiles();
+        Array.Sort(dirs, delegate(DirectoryInfo x, DirectoryInfo y) { return string.Compare(x.Name, y.Name, StringComparison.OrdinalIgnoreCase); });
         Array.Sort(files, delegate(FileInfo x, FileInfo y) { return y.LastWriteTimeUtc.CompareTo(x.LastWriteTimeUtc); });
-        StringBuilder sb = new StringBuilder("[");
+        StringBuilder sb = new StringBuilder("{\"p\":" + Q(rel) + ",\"dirs\":[");
         bool first = true;
+        foreach (DirectoryInfo d in dirs)
+        {
+            if ((d.Attributes & FileAttributes.Hidden) != 0) continue;
+            int cnt = 0;
+            try { cnt = d.GetFileSystemInfos().Length; } catch { }
+            if (!first) sb.Append(',');
+            first = false;
+            sb.Append("{\"n\":").Append(Q(d.Name)).Append(",\"t\":").Append((long)(d.LastWriteTimeUtc - epoch).TotalMilliseconds).Append(",\"c\":").Append(cnt).Append("}");
+        }
+        sb.Append("],\"files\":[");
+        first = true;
         foreach (FileInfo f in files)
         {
             if ((f.Attributes & FileAttributes.Hidden) != 0) continue;
@@ -831,15 +1312,119 @@ public static class FileServer
             sb.Append(",\"k\":\"").Append(Kind(f.Extension)).Append("\"");
             sb.Append(",\"e\":").Append(Q(f.Extension.TrimStart('.').ToLowerInvariant())).Append("}");
         }
-        sb.Append(']');
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
+    static void DoList(HttpListenerContext c, Account a)
+    {
+        string rel = NormRel(QS(c, "p"));
+        string dir = Resolve(a, rel);
+        if (dir == null || !Directory.Exists(dir)) { Json(c, 200, "{\"err\":\"nodir\"}"); return; }
+        Json(c, 200, ListJson(dir, rel));
+    }
+
+    static void CollectDirs(string baseDir, string rel, List<string> outl, int depth)
+    {
+        if (outl.Count > 400 || depth > 8) return;
+        try
+        {
+            string[] ds = Directory.GetDirectories(rel.Length == 0 ? baseDir : Path.Combine(baseDir, rel));
+            Array.Sort(ds, StringComparer.OrdinalIgnoreCase);
+            foreach (string d in ds)
+            {
+                string r = rel.Length == 0 ? Path.GetFileName(d) : rel + "/" + Path.GetFileName(d);
+                outl.Add(r);
+                CollectDirs(baseDir, r, outl, depth + 1);
+            }
+        }
+        catch { }
+    }
+
+    static void DoFolders(HttpListenerContext c, Account a)
+    {
+        List<string> l = new List<string>();
+        CollectDirs(FolderPath(a), "", l, 0);
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < l.Count; i++) { if (i > 0) sb.Append(','); sb.Append(Q(l[i])); }
+        sb.Append("]");
         Json(c, 200, sb.ToString());
     }
 
-    // Chunked upload: each request carries one part of the file (works through the tunnel's body limit).
+    static void DoMkdir(HttpListenerContext c, Account a)
+    {
+        Dictionary<string, string> f = ReadForm(c);
+        string dir = Resolve(a, NormRel(V(f, "p")));
+        string name = V(f, "name").Trim();
+        if (dir == null || !Directory.Exists(dir) || name.Length == 0 || name.Length > 100 || Safe(name) != name) { Json(c, 200, "{\"err\":\"bad\"}"); return; }
+        string full = Path.Combine(dir, name);
+        if (File.Exists(full) || Directory.Exists(full)) { Json(c, 200, "{\"err\":\"exists\"}"); return; }
+        try { Directory.CreateDirectory(full); } catch { Json(c, 200, "{\"err\":\"bad\"}"); return; }
+        Json(c, 200, "{\"ok\":1}");
+    }
+
+    static void DoRename(HttpListenerContext c, Account a)
+    {
+        Dictionary<string, string> f = ReadForm(c);
+        string p = NormRel(V(f, "p"));
+        string name = V(f, "name"), to = V(f, "to").Trim();
+        string src = Resolve(a, JoinRel(p, name));
+        string dir = Resolve(a, p);
+        if (src == null || dir == null || name.Length == 0 || to.Length == 0 || to.Length > 150 || Safe(to) != to) { Json(c, 200, "{\"err\":\"bad\"}"); return; }
+        string dst = Path.Combine(dir, to);
+        bool isDir = Directory.Exists(src);
+        if (!isDir && !File.Exists(src)) { Json(c, 200, "{\"err\":\"nodir\"}"); return; }
+        if (string.Equals(src, dst, StringComparison.OrdinalIgnoreCase) && src != dst) { /* only the case of letters changes */ }
+        else if (File.Exists(dst) || Directory.Exists(dst)) { Json(c, 200, "{\"err\":\"exists\"}"); return; }
+        try { if (isDir) Directory.Move(src, dst); else File.Move(src, dst); }
+        catch { Json(c, 200, "{\"err\":\"busy\"}"); return; }
+        Json(c, 200, "{\"ok\":1}");
+    }
+
+    static void DoMove(HttpListenerContext c, Account a)
+    {
+        Dictionary<string, string> f = ReadForm(c);
+        string p = NormRel(V(f, "p"));
+        string name = V(f, "name");
+        string src = Resolve(a, JoinRel(p, name));
+        string destDir = Resolve(a, NormRel(V(f, "to")));
+        if (src == null || destDir == null || name.Length == 0 || !Directory.Exists(destDir)) { Json(c, 200, "{\"err\":\"bad\"}"); return; }
+        bool isDir = Directory.Exists(src);
+        if (!isDir && !File.Exists(src)) { Json(c, 200, "{\"err\":\"nodir\"}"); return; }
+        string dst = Path.Combine(destDir, name);
+        if (isDir)
+        {
+            string s1 = src.TrimEnd('\\') + "\\";
+            string d1 = destDir.TrimEnd('\\') + "\\";
+            if (d1.StartsWith(s1, StringComparison.OrdinalIgnoreCase)) { Json(c, 200, "{\"err\":\"inside\"}"); return; }
+        }
+        if (File.Exists(dst) || Directory.Exists(dst)) { Json(c, 200, "{\"err\":\"exists\"}"); return; }
+        try { if (isDir) Directory.Move(src, dst); else File.Move(src, dst); }
+        catch { Json(c, 200, "{\"err\":\"busy\"}"); return; }
+        Json(c, 200, "{\"ok\":1}");
+    }
+
+    static void DoDelete(HttpListenerContext c, Account a)
+    {
+        string rel = JoinRel(NormRel(QS(c, "p")), QS(c, "name"));
+        string full = Resolve(a, rel);
+        if (full == null || QS(c, "name").Length == 0) { Json(c, 200, "{\"err\":\"bad\"}"); return; }
+        try
+        {
+            if (Directory.Exists(full)) { Directory.Delete(full, true); Log("delete", a.Id, Ip(c), QS(c, "name")); }
+            else if (File.Exists(full)) { File.Delete(full); Log("delete", a.Id, Ip(c), QS(c, "name")); }
+        }
+        catch { Json(c, 200, "{\"err\":\"busy\"}"); return; }
+        Json(c, 200, "{\"ok\":1}");
+    }
+
     static void DoUpload(HttpListenerContext c, Account a)
     {
         bool admin = IsAdmin(a);
-        string dir = FolderPath(a);
+        string relDir = "";
+        try { relDir = NormRel(Uri.UnescapeDataString(c.Request.Headers["X-Path"] ?? "")); } catch { }
+        string dir = Resolve(a, relDir);
+        if (dir == null) { Json(c, 400, "{\"err\":\"bad\"}"); return; }
         string name = "file";
         try { name = Uri.UnescapeDataString(c.Request.Headers["X-Name"] ?? "file"); } catch { }
         name = Safe(name);
@@ -861,13 +1446,7 @@ public static class FileServer
             }
             long qb = QuotaBytes(a);
             if (qb > 0 && Used(a) + total > qb) { Json(c, 413, "{\"err\":\"quota\"}"); return; }
-            long reserve = (long)(GetD("reserve", 2) * 1073741824.0);
-            try
-            {
-                DriveInfo di = new DriveInfo(Path.GetPathRoot(root));
-                if (di.AvailableFreeSpace - total < reserve) { Json(c, 507, "{\"err\":\"disk\"}"); return; }
-            }
-            catch { }
+            if (!DiskOk(total)) { Json(c, 507, "{\"err\":\"disk\"}"); return; }
             id = RandHex(16);
         }
         else if (!IsHex(id)) { Json(c, 400, "{\"err\":\"bad\"}"); return; }
@@ -897,6 +1476,7 @@ public static class FileServer
             Json(c, 400, "{\"err\":\"bad\"}");
             return;
         }
+        string finalName = "";
         if (last)
         {
             string final;
@@ -905,18 +1485,36 @@ public static class FileServer
                 final = Unique(dir, name);
                 File.Move(part, final);
             }
-            Log("upload", a.Login, Ip(c), Path.GetFileName(final));
+            finalName = Path.GetFileName(final);
+            Log("upload", a.Id, Ip(c), finalName);
         }
-        Json(c, 200, "{\"ok\":1,\"id\":" + Q(id) + "}");
+        Json(c, 200, "{\"ok\":1,\"id\":" + Q(id) + ",\"name\":" + Q(finalName) + "}");
+    }
+
+    static void DoFile(HttpListenerContext c, Account a, bool download)
+    {
+        string name = QS(c, "name");
+        string full = Resolve(a, JoinRel(NormRel(QS(c, "p")), name));
+        if (full == null || name.Length == 0 || !File.Exists(full))
+        {
+            Log("nofile", a.Id, Ip(c), "p=" + QS(c, "p") + " name=" + name);
+            Send(c, 404, "text/plain", "Not found: " + name);
+            return;
+        }
+        ServeFile(c, full, name, download);
+    }
+
+    static void DoZip(HttpListenerContext c, Account a)
+    {
+        string name = QS(c, "name");
+        string full = Resolve(a, JoinRel(NormRel(QS(c, "p")), name));
+        if (full == null || !Directory.Exists(full)) { Send(c, 404, "text/plain", "Not found"); return; }
+        ServeZip(c, full, name.Length > 0 ? name : "files");
     }
 
     // Serves a file inline (preview) or as attachment. Supports Range requests (video seeking).
-    static void DoFile(HttpListenerContext c, Account a, bool download)
+    static void ServeFile(HttpListenerContext c, string full, string name, bool download)
     {
-        string name = Safe(c.Request.QueryString["name"]);
-        string full = Path.Combine(FolderPath(a), name);
-        if (!File.Exists(full)) { Send(c, 404, "text/plain", "Not found"); return; }
-
         string ext = Path.GetExtension(name);
         string mime = download ? "application/octet-stream" : Mime(ext);
         long len = new FileInfo(full).Length;
@@ -971,7 +1569,7 @@ public static class FileServer
             c.Response.AddHeader("Cache-Control", "private, max-age=600");
             if (ext.ToLowerInvariant() == ".svg") c.Response.AddHeader("Content-Security-Policy", "sandbox");
         }
-        c.Response.AddHeader("Content-Disposition", (download ? "attachment" : "inline") + "; filename*=UTF-8''" + Uri.EscapeDataString(name));
+        c.Response.AddHeader("Content-Disposition", Disp(download, name));
         c.Response.ContentLength64 = count;
 
         using (FileStream fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
@@ -991,12 +1589,754 @@ public static class FileServer
         c.Response.Close();
     }
 
-    static void DoDelete(HttpListenerContext c, Account a)
+    static void ServeZip(HttpListenerContext c, string dir, string zipName)
     {
-        string name = Safe(c.Request.QueryString["name"]);
-        string full = Path.Combine(FolderPath(a), name);
-        try { if (File.Exists(full)) { File.Delete(full); Log("delete", a.Login, Ip(c), name); } } catch { }
+        c.Response.StatusCode = 200;
+        c.Response.ContentType = "application/zip";
+        c.Response.SendChunked = true;
+        c.Response.AddHeader("Content-Disposition", Disp(true, zipName + ".zip"));
+        using (ZipArchive za = new ZipArchive(c.Response.OutputStream, ZipArchiveMode.Create, true, Encoding.UTF8))
+        {
+            AddToZip(za, dir, "");
+        }
+        c.Response.Close();
+    }
+
+    static void AddToZip(ZipArchive za, string dir, string prefix)
+    {
+        foreach (string f in Directory.GetFiles(dir))
+        {
+            if (f.EndsWith(".part", StringComparison.OrdinalIgnoreCase)) continue;
+            ZipArchiveEntry e = za.CreateEntry(prefix + Path.GetFileName(f), CompressionLevel.Fastest);
+            using (Stream es = e.Open())
+            using (FileStream fs = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                fs.CopyTo(es);
+        }
+        foreach (string d in Directory.GetDirectories(dir))
+            AddToZip(za, d, prefix + Path.GetFileName(d) + "/");
+    }
+
+    // Finds what a download address (the same address the browser would use) points to.
+    static string LinkTarget(Account me, string u, out string name, out bool zip)
+    {
+        name = ""; zip = false;
+        string full = null;
+        int qi = u.IndexOf('?');
+        string upath = qi >= 0 ? u.Substring(0, qi) : u;
+        string query = qi >= 0 ? u.Substring(qi + 1) : "";
+        if (upath.StartsWith("/download"))
+        {
+            name = QParam(query, "name");
+            full = Resolve(me, JoinRel(NormRel(QParam(query, "p")), name));
+            if (name.Length == 0 || full == null || !File.Exists(full)) full = null;
+        }
+        else if (upath.StartsWith("/zip"))
+        {
+            zip = true;
+            string nm = QParam(query, "name");
+            full = Resolve(me, JoinRel(NormRel(QParam(query, "p")), nm));
+            name = nm.Length > 0 ? nm : "files";
+            if (full == null || !Directory.Exists(full)) full = null;
+        }
+        else if (upath.StartsWith("/api/chat/item"))
+        {
+            Msg msg; Account sender;
+            full = ChatItemPath(me, QParam(query, "peer"), ParseL(QParam(query, "m"), 0), NormRel(QParam(query, "sub")), out msg, out sender);
+            if (full != null)
+            {
+                name = Path.GetFileName(full);
+                if (QParam(query, "z") == "1") { zip = true; if (!Directory.Exists(full)) full = null; }
+                else if (!File.Exists(full)) full = null;
+            }
+        }
+        return full;
+    }
+
+    // One-time download links: /get/<token>/<file name>. They work without cookies and the browser
+    // always sees the real file name at the end of the address.
+    static string MakeLink(string full, string name, bool zip, int minutes)
+    {
+        string tok = RandHex(16);
+        lock (lk)
+        {
+            List<string> old = new List<string>();
+            foreach (KeyValuePair<string, Link> kv in links) { if (kv.Value.Exp < DateTime.UtcNow) old.Add(kv.Key); }
+            foreach (string k in old) links.Remove(k);
+            Link ln = new Link();
+            ln.Full = full; ln.Name = name; ln.Zip = zip; ln.Exp = DateTime.UtcNow.AddMinutes(minutes);
+            links[tok] = ln;
+        }
+        return "/get/" + tok + "/" + Uri.EscapeDataString(name + (zip ? ".zip" : ""));
+    }
+
+    static void DoLink(HttpListenerContext c, Account me)
+    {
+        Dictionary<string, string> f = ReadForm(c);
+        string u = V(f, "u");
+        string name; bool zip;
+        string full = LinkTarget(me, u, out name, out zip);
+        if (full == null)
+        {
+            Log("nofile", me.Id, Ip(c), u);
+            Json(c, 200, "{\"err\":\"gone\"}");
+            return;
+        }
+        Json(c, 200, "{\"url\":" + Q(MakeLink(full, name, zip, 30)) + "}");
+    }
+
+    // ---- folders as ZIP: the archive is built in a temporary file first (works with every browser,
+    // has a known size and survives interrupted downloads), the page shows the progress
+    static void DoZipStart(HttpListenerContext c, Account me)
+    {
+        Dictionary<string, string> f = ReadForm(c);
+        string name; bool zip;
+        string full = LinkTarget(me, V(f, "u"), out name, out zip);
+        if (full == null || !zip) { Json(c, 200, "{\"err\":\"gone\"}"); return; }
+        long total = DirSize(full);
+        if (!DiskOk(total)) { Json(c, 200, "{\"err\":\"disk\"}"); return; }
+        ZipJob j = new ZipJob();
+        j.Id = RandHex(8); j.AccId = me.Id; j.Dir = full; j.Name = name; j.Total = total;
+        j.Exp = DateTime.UtcNow.AddHours(2);
+        j.Tmp = Path.Combine(tmpDir, j.Id + ".zip");
+        lock (lk)
+        {
+            List<string> old = new List<string>();
+            foreach (KeyValuePair<string, ZipJob> kv in zjobs) { if (kv.Value.Exp < DateTime.UtcNow) old.Add(kv.Key); }
+            foreach (string k in old)
+            {
+                try { File.Delete(zjobs[k].Tmp); } catch { }
+                zjobs.Remove(k);
+            }
+            zjobs[j.Id] = j;
+        }
+        ThreadPool.QueueUserWorkItem(delegate(object o) { BuildZip(j); });
+        Json(c, 200, "{\"job\":" + Q(j.Id) + "}");
+    }
+
+    static void DoZipStatus(HttpListenerContext c, Account me)
+    {
+        ZipJob j;
+        lock (lk) { zjobs.TryGetValue(QS(c, "job"), out j); }
+        if (j == null || j.AccId != me.Id) { Json(c, 200, "{\"st\":2}"); return; }
+        Json(c, 200, "{\"st\":" + j.State + ",\"done\":" + j.Done + ",\"total\":" + j.Total + ",\"url\":" + Q(j.Url) + "}");
+    }
+
+    static void BuildZip(ZipJob j)
+    {
+        try
+        {
+            Directory.CreateDirectory(tmpDir);
+            using (FileStream fs = new FileStream(j.Tmp, FileMode.Create, FileAccess.ReadWrite))
+            {
+                using (ZipArchive za = new ZipArchive(fs, ZipArchiveMode.Create, true, Encoding.UTF8))
+                {
+                    AddToZipJob(za, j.Dir, "", j);
+                }
+            }
+            j.Url = MakeLink(j.Tmp, j.Name + ".zip", false, 120);
+            j.State = 1;
+        }
+        catch
+        {
+            j.State = 2;
+            try { File.Delete(j.Tmp); } catch { }
+        }
+    }
+
+    static void AddToZipJob(ZipArchive za, string dir, string prefix, ZipJob j)
+    {
+        foreach (string f in Directory.GetFiles(dir))
+        {
+            if (f.EndsWith(".part", StringComparison.OrdinalIgnoreCase)) continue;
+            FileStream src = null;
+            try { src = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete); }
+            catch { continue; }
+            using (src)
+            {
+                ZipArchiveEntry e = za.CreateEntry(prefix + Path.GetFileName(f), CompressionLevel.NoCompression);
+                using (Stream es = e.Open())
+                {
+                    byte[] buf = new byte[262144];
+                    int n;
+                    while ((n = src.Read(buf, 0, buf.Length)) > 0) { es.Write(buf, 0, n); j.Done += n; }
+                }
+            }
+        }
+        foreach (string d in Directory.GetDirectories(dir))
+            AddToZipJob(za, d, prefix + Path.GetFileName(d) + "/", j);
+    }
+
+    static void DoGet(HttpListenerContext c, string rawPath)
+    {
+        string[] seg = rawPath.Split('/');
+        Link ln = null;
+        if (seg.Length >= 3)
+        {
+            lock (lk)
+            {
+                if (links.TryGetValue(seg[2], out ln) && ln.Exp < DateTime.UtcNow) { links.Remove(seg[2]); ln = null; }
+            }
+        }
+        if (ln == null) { Send(c, 404, "text/plain", "Link expired"); return; }
+        if (ln.Zip)
+        {
+            if (!Directory.Exists(ln.Full)) { Send(c, 404, "text/plain", "Not found"); return; }
+            ServeZip(c, ln.Full, ln.Name);
+            return;
+        }
+        if (!File.Exists(ln.Full)) { Send(c, 404, "text/plain", "Not found"); return; }
+        ServeFile(c, ln.Full, ln.Name, true);
+    }
+
+    static void CopyDir(string src, string dst)
+    {
+        Directory.CreateDirectory(dst);
+        foreach (string f in Directory.GetFiles(src))
+        {
+            if (f.EndsWith(".part", StringComparison.OrdinalIgnoreCase)) continue;
+            File.Copy(f, Path.Combine(dst, Path.GetFileName(f)), false);
+        }
+        foreach (string d in Directory.GetDirectories(src))
+            CopyDir(d, Path.Combine(dst, Path.GetFileName(d)));
+    }
+
+    // ------------------------------------------------------------ chat
+    static string ConvKey(string a, string b) { return string.CompareOrdinal(a, b) <= 0 ? a + "_" + b : b + "_" + a; }
+
+    static Conv GetConv(string idA, string idB, bool create)
+    {
+        string key = ConvKey(idA, idB);
+        lock (lk)
+        {
+            Conv cv;
+            if (convs.TryGetValue(key, out cv)) return cv;
+            if (!create) return null;
+            cv = new Conv();
+            cv.Key = key;
+            string[] ids = key.Split('_');
+            cv.P1 = ids[0]; cv.P2 = ids[1];
+            convs[key] = cv;
+            return cv;
+        }
+    }
+
+    static void LoadChats()
+    {
+        if (!Directory.Exists(chatDir)) return;
+        foreach (string f in Directory.GetFiles(chatDir, "*.txt"))
+        {
+            string key = Path.GetFileNameWithoutExtension(f);
+            string[] ids = key.Split('_');
+            if (ids.Length != 2) continue;
+            Conv cv = new Conv();
+            cv.Key = key; cv.P1 = ids[0]; cv.P2 = ids[1];
+            try
+            {
+                foreach (string line in File.ReadAllLines(f, Encoding.UTF8))
+                {
+                    string[] p = line.Split('\t');
+                    if (p.Length < 7) continue;
+                    Msg m = new Msg();
+                    m.Id = ParseL(p[0], 0); m.Ts = ParseL(p[1], 0); m.From = p[2]; m.Type = p[3];
+                    m.A = Unesc(p[4]); m.B = Unesc(p[5]); m.C = Unesc(p[6]);
+                    cv.List.Add(m);
+                    if (m.Id > lastMsgId) lastMsgId = m.Id;
+                }
+            }
+            catch { }
+            convs[key] = cv;
+        }
+    }
+
+    static Msg AddMsg(Account frm, Account to, string type, string a, string b, string c2)
+    {
+        Msg m = new Msg();
+        lock (lk)
+        {
+            Conv cv = GetConv(frm.Id, to.Id, true);
+            lastMsgId = Math.Max(lastMsgId + 1, NowMs());
+            m.Id = lastMsgId; m.Ts = NowMs(); m.From = frm.Id; m.Type = type; m.A = a; m.B = b; m.C = c2;
+            cv.List.Add(m);
+            try
+            {
+                Directory.CreateDirectory(chatDir);
+                File.AppendAllText(Path.Combine(chatDir, cv.Key + ".txt"),
+                    m.Id + "\t" + m.Ts + "\t" + m.From + "\t" + m.Type + "\t" + Esc(a) + "\t" + Esc(b) + "\t" + Esc(c2) + "\r\n", Encoding.UTF8);
+            }
+            catch { }
+        }
+        return m;
+    }
+
+    static void SaveReads()
+    {
+        lock (lk)
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder();
+                foreach (KeyValuePair<string, long> kv in reads) sb.Append(kv.Key).Append('\t').Append(kv.Value).Append("\r\n");
+                File.WriteAllText(readFile, sb.ToString(), Encoding.UTF8);
+            }
+            catch { }
+        }
+    }
+
+    static void LoadReads()
+    {
+        if (!File.Exists(readFile)) return;
+        foreach (string line in File.ReadAllLines(readFile, Encoding.UTF8))
+        {
+            string[] p = line.Split('\t');
+            if (p.Length < 2) continue;
+            reads[p[0]] = ParseL(p[1], 0);
+        }
+    }
+
+    static long ReadMark(string accId, string key)
+    {
+        long v;
+        return reads.TryGetValue(accId + "|" + key, out v) ? v : 0;
+    }
+
+    static void MarkRead(Account me, Conv cv)
+    {
+        lock (lk)
+        {
+            long last = cv.List.Count > 0 ? cv.List[cv.List.Count - 1].Id : 0;
+            string k = me.Id + "|" + cv.Key;
+            long old;
+            if (!reads.TryGetValue(k, out old) || old < last) { reads[k] = last; SaveReads(); }
+        }
+    }
+
+    static int UnreadIn(Account me, Conv cv)
+    {
+        long mark = ReadMark(me.Id, cv.Key);
+        int n = 0;
+        foreach (Msg m in cv.List) { if (m.Id > mark && m.From != me.Id) n++; }
+        return n;
+    }
+
+    static int UnreadTotal(Account me)
+    {
+        int n = 0;
+        if (Get("chat", "1") != "1") return 0;
+        lock (lk)
+        {
+            foreach (Conv cv in convs.Values)
+            {
+                if (cv.P1 == me.Id || cv.P2 == me.Id) n += UnreadIn(me, cv);
+            }
+        }
+        return n;
+    }
+
+    static string MsgJson(Msg m, Account me, Account peer)
+    {
+        Account sender = m.From == me.Id ? me : peer;
+        StringBuilder sb = new StringBuilder("{");
+        sb.Append("\"i\":").Append(m.Id).Append(",\"ts\":").Append(m.Ts).Append(",\"f\":").Append(Q(m.From)).Append(",\"k\":").Append(Q(m.Type));
+        if (m.Type == "text") sb.Append(",\"t\":").Append(Q(m.A));
+        else
+        {
+            string full = Resolve(sender, m.A);
+            bool ok = false;
+            if (full != null) ok = m.Type == "file" ? File.Exists(full) : Directory.Exists(full);
+            string ext = Path.GetExtension(m.B);
+            sb.Append(",\"t\":").Append(Q(m.B)).Append(",\"s\":").Append(ParseL(m.C, 0));
+            sb.Append(",\"x\":").Append(ok ? "1" : "0");
+            sb.Append(",\"kd\":").Append(Q(m.Type == "file" ? Kind(ext) : "dir"));
+            sb.Append(",\"e\":").Append(Q(ext.TrimStart('.').ToLowerInvariant()));
+        }
+        sb.Append("}");
+        return sb.ToString();
+    }
+
+    static string Preview(Msg m)
+    {
+        if (m.Type == "text") return Trunc(m.A, 100);
+        return (m.Type == "file" ? TxtFile : TxtDir) + ": " + m.B;
+    }
+
+    static void DoChat(HttpListenerContext c, Account me, string path, string m)
+    {
+        if (Get("chat", "1") != "1") { Json(c, 200, "{\"err\":\"chatoff\"}"); return; }
+        if (path == "/api/chat/list" && m == "GET") { DoChatList(c, me); return; }
+        if (path == "/api/chat/msgs" && m == "GET") { DoChatMsgs(c, me); return; }
+        if (path == "/api/chat/find" && m == "GET") { DoChatFind(c, me); return; }
+        if (path == "/api/chat/item" && m == "GET") { DoChatItem(c, me); return; }
+        if (path == "/api/chat/dir" && m == "GET") { DoChatDir(c, me); return; }
+        if (path == "/api/chat/send" && m == "POST") { DoChatSend(c, me); return; }
+        if (path == "/api/chat/save" && m == "POST") { DoChatSave(c, me); return; }
+        Json(c, 404, "{\"err\":\"nf\"}");
+    }
+
+    static void DoChatFind(HttpListenerContext c, Account me)
+    {
+        string id = QS(c, "id").Trim();
+        Account a;
+        lock (lk) { byId.TryGetValue(id, out a); }
+        if (a == null || a.Blocked != 0 || object.ReferenceEquals(a, me)) { Json(c, 200, "{\"err\":\"nouser\"}"); return; }
+        Json(c, 200, "{\"id\":" + Q(a.Id) + ",\"name\":" + Q(DisplayName(a)) + "}");
+    }
+
+    static void DoChatList(HttpListenerContext c, Account me)
+    {
+        StringBuilder sb = new StringBuilder("[");
+        lock (lk)
+        {
+            List<Conv> mine = new List<Conv>();
+            foreach (Conv cv in convs.Values)
+            {
+                if (cv.List.Count > 0 && (cv.P1 == me.Id || cv.P2 == me.Id)) mine.Add(cv);
+            }
+            mine.Sort(delegate(Conv x, Conv y) { return y.List[y.List.Count - 1].Id.CompareTo(x.List[x.List.Count - 1].Id); });
+            bool first = true;
+            foreach (Conv cv in mine)
+            {
+                string peerId = cv.P1 == me.Id ? cv.P2 : cv.P1;
+                Account peer;
+                if (!byId.TryGetValue(peerId, out peer)) continue;
+                Msg last = cv.List[cv.List.Count - 1];
+                if (!first) sb.Append(',');
+                first = false;
+                sb.Append("{\"id\":").Append(Q(peerId)).Append(",\"name\":").Append(Q(DisplayName(peer)));
+                sb.Append(",\"u\":").Append(UnreadIn(me, cv));
+                sb.Append(",\"ts\":").Append(last.Ts).Append(",\"mine\":").Append(last.From == me.Id ? "1" : "0");
+                sb.Append(",\"k\":").Append(Q(last.Type)).Append(",\"t\":").Append(Q(last.Type == "text" ? Trunc(last.A, 80) : last.B)).Append("}");
+            }
+        }
+        sb.Append("]");
+        Json(c, 200, sb.ToString());
+    }
+
+    static void DoChatMsgs(HttpListenerContext c, Account me)
+    {
+        string peerId = QS(c, "peer");
+        long after = ParseL(QS(c, "after"), 0);
+        Account peer;
+        lock (lk) { byId.TryGetValue(peerId, out peer); }
+        if (peer == null) { Json(c, 200, "{\"err\":\"nouser\"}"); return; }
+        Conv cv = GetConv(me.Id, peer.Id, false);
+        StringBuilder sb = new StringBuilder("{\"peer\":{\"id\":" + Q(peer.Id) + ",\"name\":" + Q(DisplayName(peer)) + "},\"msgs\":[");
+        if (cv != null)
+        {
+            lock (lk)
+            {
+                bool first = true;
+                foreach (Msg m in cv.List)
+                {
+                    if (m.Id <= after) continue;
+                    if (!first) sb.Append(',');
+                    first = false;
+                    sb.Append(MsgJson(m, me, peer));
+                }
+            }
+            if (QS(c, "mark") == "1") MarkRead(me, cv);
+        }
+        sb.Append("]}");
+        Json(c, 200, sb.ToString());
+    }
+
+    static void DoChatSend(HttpListenerContext c, Account me)
+    {
+        Dictionary<string, string> f = ReadForm(c);
+        Account peer;
+        lock (lk) { byId.TryGetValue(V(f, "peer"), out peer); }
+        if (peer == null || object.ReferenceEquals(peer, me) || peer.Blocked != 0) { Json(c, 200, "{\"err\":\"nouser\"}"); return; }
+        if (Count("msg:" + me.Id, 60) >= 40) { Json(c, 200, "{\"err\":\"locked\"}"); return; }
+        string type = V(f, "type");
+        Msg msg;
+        if (type == "text")
+        {
+            string t = V(f, "text").Trim();
+            if (t.Length == 0) { Json(c, 200, "{\"err\":\"bad\"}"); return; }
+            msg = AddMsg(me, peer, "text", Trunc(t, 2000), "", "");
+        }
+        else if (type == "file" || type == "dir")
+        {
+            string name = V(f, "name");
+            string rel = JoinRel(NormRel(V(f, "p")), name);
+            string full = Resolve(me, rel);
+            if (full == null || name.Length == 0) { Json(c, 200, "{\"err\":\"bad\"}"); return; }
+            long size = 0;
+            if (type == "file")
+            {
+                if (!File.Exists(full)) { Json(c, 200, "{\"err\":\"gone\"}"); return; }
+                size = new FileInfo(full).Length;
+            }
+            else
+            {
+                if (!Directory.Exists(full)) { Json(c, 200, "{\"err\":\"gone\"}"); return; }
+                size = DirSize(full);
+            }
+            msg = AddMsg(me, peer, type, rel, name, size.ToString());
+        }
+        else { Json(c, 200, "{\"err\":\"bad\"}"); return; }
+        Hit("msg:" + me.Id);
+        Notify(peer, DisplayName(me), Preview(msg), "/#chat/" + me.Id, "chat" + me.Id);
+        Json(c, 200, "{\"ok\":1,\"m\":" + MsgJson(msg, me, peer) + "}");
+    }
+
+    // Finds the full path of an item shared in a message (or of a file inside a shared folder).
+    static string ChatItemPath(Account me, string peerId, long mid, string sub, out Msg msg, out Account sender)
+    {
+        msg = null; sender = null;
+        Conv cv = GetConv(me.Id, peerId, false);
+        if (cv == null) return null;
+        Msg found = null;
+        Account snd = null;
+        lock (lk)
+        {
+            foreach (Msg x in cv.List)
+            {
+                if (x.Id == mid) { found = x; break; }
+            }
+            if (found != null) byId.TryGetValue(found.From, out snd);
+        }
+        if (found == null || found.Type == "text" || snd == null) return null;
+        msg = found; sender = snd;
+        string rel = found.A;
+        if (!string.IsNullOrEmpty(sub))
+        {
+            if (found.Type != "dir") return null;
+            rel = JoinRel(found.A, sub);
+        }
+        return Resolve(snd, rel);
+    }
+
+    static void DoChatItem(HttpListenerContext c, Account me)
+    {
+        Msg msg; Account sender;
+        string full = ChatItemPath(me, QS(c, "peer"), ParseL(QS(c, "m"), 0), NormRel(QS(c, "sub")), out msg, out sender);
+        if (full == null) { Send(c, 404, "text/plain", "Not found"); return; }
+        if (QS(c, "z") == "1")
+        {
+            if (!Directory.Exists(full)) { Send(c, 404, "text/plain", "Not found"); return; }
+            ServeZip(c, full, Path.GetFileName(full));
+            return;
+        }
+        if (!File.Exists(full)) { Send(c, 404, "text/plain", "Not found"); return; }
+        ServeFile(c, full, Path.GetFileName(full), QS(c, "dl") == "1");
+    }
+
+    static void DoChatDir(HttpListenerContext c, Account me)
+    {
+        Msg msg; Account sender;
+        string sub = NormRel(QS(c, "sub"));
+        string full = ChatItemPath(me, QS(c, "peer"), ParseL(QS(c, "m"), 0), sub, out msg, out sender);
+        if (full == null || msg.Type != "dir" || !Directory.Exists(full)) { Json(c, 200, "{\"err\":\"gone\"}"); return; }
+        Json(c, 200, ListJson(full, sub));
+    }
+
+    static void DoChatSave(HttpListenerContext c, Account me)
+    {
+        Dictionary<string, string> f = ReadForm(c);
+        Msg msg; Account sender;
+        string full = ChatItemPath(me, V(f, "peer"), ParseL(V(f, "m"), 0), NormRel(V(f, "sub")), out msg, out sender);
+        if (full == null) { Json(c, 200, "{\"err\":\"gone\"}"); return; }
+        bool isDir = Directory.Exists(full);
+        if (!isDir && !File.Exists(full)) { Json(c, 200, "{\"err\":\"gone\"}"); return; }
+        long size = isDir ? DirSize(full) : new FileInfo(full).Length;
+        long qb = QuotaBytes(me);
+        if (qb > 0 && Used(me) + size > qb) { Json(c, 200, "{\"err\":\"quota\"}"); return; }
+        if (!DiskOk(size)) { Json(c, 200, "{\"err\":\"disk\"}"); return; }
+        string fromName = Safe(DisplayName(sender));
+        string destDir = Path.Combine(Path.Combine(FolderPath(me), DirRecv), fromName);
+        try
+        {
+            Directory.CreateDirectory(destDir);
+            string nm = Path.GetFileName(full);
+            if (isDir) CopyDir(full, UniqueDir(destDir, nm));
+            else File.Copy(full, Unique(destDir, nm), false);
+        }
+        catch { Json(c, 200, "{\"err\":\"busy\"}"); return; }
         Json(c, 200, "{\"ok\":1}");
+    }
+
+    // ------------------------------------------------------------ push notifications (web push, no payload)
+    static void SaveSubs()
+    {
+        lock (lk)
+        {
+            try
+            {
+                StringBuilder sb = new StringBuilder();
+                foreach (Sub s in subs) sb.Append(s.AccId).Append('\t').Append(s.Token).Append('\t').Append(s.Endpoint).Append("\r\n");
+                File.WriteAllText(subFile, sb.ToString(), Encoding.UTF8);
+            }
+            catch { }
+        }
+    }
+
+    static void LoadSubs()
+    {
+        if (!File.Exists(subFile)) return;
+        foreach (string line in File.ReadAllLines(subFile, Encoding.UTF8))
+        {
+            string[] p = line.Split('\t');
+            if (p.Length < 3 || !byId.ContainsKey(p[0])) continue;
+            Sub s = new Sub();
+            s.AccId = p[0]; s.Token = p[1]; s.Endpoint = p[2];
+            subs.Add(s);
+        }
+    }
+
+    static void InitVapid()
+    {
+        try
+        {
+            string pv = Get("vapidPriv", "");
+            if (pv.Length > 0)
+            {
+                try { vapidKey = CngKey.Import(Convert.FromBase64String(pv), CngKeyBlobFormat.EccPrivateBlob); }
+                catch { vapidKey = null; }
+            }
+            if (vapidKey == null)
+            {
+                CngKeyCreationParameters kp = new CngKeyCreationParameters();
+                kp.ExportPolicy = CngExportPolicies.AllowPlaintextExport;
+                CngKey k = CngKey.Create(CngAlgorithm.ECDsaP256, null, kp);
+                Put("vapidPriv", Convert.ToBase64String(k.Export(CngKeyBlobFormat.EccPrivateBlob)));
+                SaveSettings();
+                vapidKey = k;
+            }
+            byte[] bl = vapidKey.Export(CngKeyBlobFormat.EccPublicBlob);
+            byte[] pub = new byte[65];
+            pub[0] = 4;
+            Buffer.BlockCopy(bl, 8, pub, 1, 64);
+            vapidPub = B64u(pub);
+        }
+        catch { vapidKey = null; vapidPub = ""; }
+    }
+
+    static string VapidJwt(string aud)
+    {
+        string hdr = B64u(Encoding.UTF8.GetBytes("{\"typ\":\"JWT\",\"alg\":\"ES256\"}"));
+        long exp = (long)(DateTime.UtcNow - epoch).TotalSeconds + 12 * 3600;
+        string pl = B64u(Encoding.UTF8.GetBytes("{\"aud\":\"" + aud + "\",\"exp\":" + exp + ",\"sub\":\"" + PushSubject + "\"}"));
+        byte[] sig;
+        using (ECDsaCng ec = new ECDsaCng(vapidKey))
+        {
+            ec.HashAlgorithm = CngAlgorithm.Sha256;
+            sig = ec.SignData(Encoding.ASCII.GetBytes(hdr + "." + pl));
+        }
+        return hdr + "." + pl + "." + B64u(sig);
+    }
+
+    static void SendPush(Sub s)
+    {
+        if (vapidKey == null) return;
+        try
+        {
+            Uri u = new Uri(s.Endpoint);
+            string aud = u.GetLeftPart(UriPartial.Authority);
+            HttpWebRequest rq = (HttpWebRequest)WebRequest.Create(s.Endpoint);
+            rq.Method = "POST";
+            rq.ContentLength = 0;
+            rq.Timeout = 15000;
+            rq.Headers["Authorization"] = "vapid t=" + VapidJwt(aud) + ", k=" + vapidPub;
+            rq.Headers["TTL"] = "86400";
+            rq.Headers["Urgency"] = "high";
+            using (HttpWebResponse rs = (HttpWebResponse)rq.GetResponse()) { }
+        }
+        catch (WebException ex)
+        {
+            HttpWebResponse r = ex.Response as HttpWebResponse;
+            if (r != null && (r.StatusCode == HttpStatusCode.NotFound || r.StatusCode == HttpStatusCode.Gone))
+            {
+                lock (lk) { subs.Remove(s); SaveSubs(); }
+            }
+        }
+        catch { }
+    }
+
+    // Queues a notification for every device of the user that is not looking at the site right now and sends a push.
+    static void Notify(Account to, string title, string body, string url, string tag)
+    {
+        List<Sub> targets = new List<Sub>();
+        lock (lk)
+        {
+            foreach (Sub s in subs)
+            {
+                if (s.AccId != to.Id) continue;
+                Session ss;
+                if (sess.TryGetValue(s.Token, out ss) && (DateTime.UtcNow - ss.Seen).TotalSeconds < 25) continue;
+                targets.Add(s);
+            }
+            foreach (Sub s in targets)
+            {
+                List<Notif> q;
+                if (!notifs.TryGetValue(s.Token, out q)) { q = new List<Notif>(); notifs[s.Token] = q; }
+                Notif n = new Notif();
+                n.Id = NowMs(); n.Title = title; n.Body = body; n.Url = url; n.Tag = tag;
+                q.Add(n);
+                if (q.Count > 20) q.RemoveAt(0);
+            }
+        }
+        foreach (Sub s in targets)
+        {
+            Sub sc = s;
+            ThreadPool.QueueUserWorkItem(delegate(object o) { SendPush(sc); });
+        }
+    }
+
+    static void DoPush(HttpListenerContext c, Account me, string path, string token)
+    {
+        if (path == "/api/push/key")
+        {
+            Json(c, 200, vapidPub.Length > 0 ? "{\"key\":" + Q(vapidPub) + "}" : "{\"err\":\"nopush\"}");
+            return;
+        }
+        if (path == "/api/push/pending")
+        {
+            List<Notif> items = null;
+            lock (lk)
+            {
+                List<Notif> q;
+                if (notifs.TryGetValue(token, out q)) { items = new List<Notif>(q); q.Clear(); }
+            }
+            int unread = UnreadTotal(me);
+            StringBuilder sb = new StringBuilder("[");
+            if (items != null)
+            {
+                for (int i = 0; i < items.Count; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    Notif n = items[i];
+                    sb.Append("{\"i\":").Append(n.Id).Append(",\"t\":").Append(Q(n.Title)).Append(",\"b\":").Append(Q(n.Body));
+                    sb.Append(",\"u\":").Append(Q(n.Url)).Append(",\"g\":").Append(Q(n.Tag)).Append(",\"n\":").Append(unread).Append("}");
+                }
+            }
+            sb.Append("]");
+            Json(c, 200, sb.ToString());
+            return;
+        }
+        if (c.Request.HttpMethod != "POST") { Json(c, 404, "{\"err\":\"nf\"}"); return; }
+        if (path == "/api/push/sub")
+        {
+            Dictionary<string, string> f = ReadForm(c);
+            string ep = V(f, "endpoint");
+            if (!ep.StartsWith("https://") || ep.Length > 1000) { Json(c, 200, "{\"err\":\"bad\"}"); return; }
+            lock (lk)
+            {
+                subs.RemoveAll(delegate(Sub x) { return x.Endpoint == ep || x.Token == token; });
+                Sub s = new Sub();
+                s.AccId = me.Id; s.Token = token; s.Endpoint = ep;
+                subs.Add(s);
+                SaveSubs();
+            }
+            Json(c, 200, "{\"ok\":1}");
+            return;
+        }
+        if (path == "/api/push/unsub")
+        {
+            lock (lk) { subs.RemoveAll(delegate(Sub x) { return x.Token == token; }); notifs.Remove(token); SaveSubs(); }
+            Json(c, 200, "{\"ok\":1}");
+            return;
+        }
+        Json(c, 404, "{\"err\":\"nf\"}");
     }
 
     // ------------------------------------------------------------ admin api
@@ -1015,6 +2355,7 @@ public static class FileServer
                 Put("reg", V(f, "reg") == "1" ? "1" : "0");
                 Put("approve", V(f, "approve") == "1" ? "1" : "0");
                 Put("maint", V(f, "maint") == "1" ? "1" : "0");
+                Put("chat", V(f, "chat") == "0" ? "0" : "1");
                 Put("maxUsers", Dbl(Math.Max(0.0, ParseD(V(f, "maxUsers"), 0))));
                 Put("defQuota", Dbl(Math.Max(0.0, ParseD(V(f, "defQuota"), 5))));
                 Put("maxFile", Dbl(Math.Max(0.0, ParseD(V(f, "maxFile"), 0))));
@@ -1022,7 +2363,7 @@ public static class FileServer
                 Put("badExt", CleanExt(V(f, "badExt")));
                 SaveSettings();
             }
-            Log("settings", me.Login, ip, "");
+            Log("settings", me.Id, ip, "");
             Json(c, 200, "{\"ok\":1}");
             return;
         }
@@ -1030,20 +2371,27 @@ public static class FileServer
         if (path == "/api/admin/notice")
         {
             string act = V(f, "act");
+            string text = "";
             lock (lk)
             {
                 if (act == "send")
                 {
-                    string t = Trunc(V(f, "text").Trim(), 500);
-                    if (t.Length == 0) { Json(c, 200, "{\"err\":\"empty\"}"); return; }
+                    text = Trunc(V(f, "text").Trim(), 500);
+                    if (text.Length == 0) { Json(c, 200, "{\"err\":\"empty\"}"); return; }
                     Put("nid", NowMs().ToString());
-                    Put("nt", t);
+                    Put("nt", text);
                     Put("ntime", NowMs().ToString());
                 }
                 else { Put("nid", ""); Put("nt", ""); Put("ntime", "0"); }
                 SaveSettings();
             }
-            Log("notice", me.Login, ip, act == "send" ? "send" : "clear");
+            Log("notice", me.Id, ip, act == "send" ? "send" : "clear");
+            if (act == "send")
+            {
+                List<Account> all;
+                lock (lk) { all = new List<Account>(accs.Values); }
+                foreach (Account x in all) Notify(x, TxtNotice, Trunc(text, 120), "/", "notice");
+            }
             Json(c, 200, "{\"ok\":1}");
             return;
         }
@@ -1059,7 +2407,7 @@ public static class FileServer
             else if (act == "kick")
             {
                 kind = "kick";
-                lock (lk) { Account a; if (accs.TryGetValue(target, out a) && !IsAdmin(a)) KillSessions(a); }
+                lock (lk) { Account a; if (accs.TryGetValue(target, out a) && !IsAdmin(a)) KillSessions(a, ""); }
             }
             else if (act == "create")
             {
@@ -1067,11 +2415,11 @@ public static class FileServer
                 string q = V(f, "q");
                 double qv = ParseD(q, double.NaN);
                 double quota = (q == "def" || double.IsNaN(qv)) ? -1 : Math.Max(0.0, qv);
-                err = CreateUser(V(f, "nl").Trim(), V(f, "np"), quota, 0, true);
+                err = CreateUser(V(f, "nl").Trim(), V(f, "np"), V(f, "nm"), quota, 0, true);
                 target = V(f, "nl").Trim();
             }
             else err = "bad";
-            if (err == null) Log(kind, me.Login, ip, target);
+            if (err == null) Log(kind, me.Id, ip, target);
             Json(c, 200, err == null ? "{\"ok\":1}" : "{\"err\":" + Q(err) + "}");
             return;
         }
@@ -1090,11 +2438,13 @@ public static class FileServer
             long disk = -1, diskTotal = -1;
             try { DriveInfo di = new DriveInfo(Path.GetPathRoot(root)); disk = di.AvailableFreeSpace; diskTotal = di.TotalSize; } catch { }
             sb.Append(",\"disk\":").Append(disk).Append(",\"diskTotal\":").Append(diskTotal);
+            sb.Append(",\"subs\":").Append(subs.Count);
 
             sb.Append(",\"set\":{\"title\":").Append(Q(Get("title", "")));
             sb.Append(",\"reg\":").Append(Get("reg", "1") == "1" ? "1" : "0");
             sb.Append(",\"approve\":").Append(Get("approve", "0") == "1" ? "1" : "0");
             sb.Append(",\"maint\":").Append(Get("maint", "0") == "1" ? "1" : "0");
+            sb.Append(",\"chat\":").Append(Get("chat", "1") == "1" ? "1" : "0");
             sb.Append(",\"maxUsers\":").Append(Dbl(GetD("maxUsers", 0)));
             sb.Append(",\"defQuota\":").Append(Dbl(GetD("defQuota", 5)));
             sb.Append(",\"maxFile\":").Append(Dbl(GetD("maxFile", 0)));
@@ -1128,6 +2478,8 @@ public static class FileServer
                 if (!first) us.Append(',');
                 first = false;
                 us.Append("{\"login\":").Append(Q(a.Login));
+                us.Append(",\"id\":").Append(Q(a.Id));
+                us.Append(",\"name\":").Append(Q(a.Name));
                 us.Append(",\"folder\":").Append(Q(a.Folder));
                 us.Append(",\"quota\":").Append(Dbl(a.Quota));
                 us.Append(",\"used\":").Append(used);
@@ -1146,11 +2498,19 @@ public static class FileServer
             {
                 string[] e = logs[i];
                 if (i != logs.Count - 1) sb.Append(',');
-                sb.Append("[").Append(e[0]).Append(",").Append(Q(e[1])).Append(",").Append(Q(e[2])).Append(",").Append(Q(e[3])).Append(",").Append(Q(e[4])).Append("]");
+                sb.Append("[").Append(e[0]).Append(",").Append(Q(e[1])).Append(",").Append(Q(ShowWho(e[2]))).Append(",").Append(Q(e[3])).Append(",").Append(Q(e[4])).Append("]");
             }
             sb.Append("]}");
         }
         Json(c, 200, sb.ToString());
+    }
+
+    // log entries store the account id (or a typed login for failed sign-ins); show the login for ids
+    static string ShowWho(string w)
+    {
+        Account a;
+        if (w.Length == 8 && byId.TryGetValue(w, out a)) return a.Login;
+        return w;
     }
 
     // ------------------------------------------------------------ output
@@ -1160,6 +2520,16 @@ public static class FileServer
         c.Response.StatusCode = code;
         c.Response.ContentType = type + "; charset=utf-8";
         c.Response.AddHeader("Cache-Control", "no-store");
+        c.Response.ContentLength64 = b.Length;
+        c.Response.OutputStream.Write(b, 0, b.Length);
+        c.Response.Close();
+    }
+
+    static void SendBytes(HttpListenerContext c, int code, string type, byte[] b, string cache)
+    {
+        c.Response.StatusCode = code;
+        c.Response.ContentType = type;
+        c.Response.AddHeader("Cache-Control", cache);
         c.Response.ContentLength64 = b.Length;
         c.Response.OutputStream.Write(b, 0, b.Length);
         c.Response.Close();
@@ -1175,9 +2545,15 @@ public static class FileServer
 
 $head = @'
 <meta charset='utf-8'>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
+<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>
 <meta name='color-scheme' content='dark'>
 <meta name='theme-color' content='#12151c'>
+<link rel='manifest' href='/manifest.webmanifest'>
+<link rel='apple-touch-icon' href='/apple-touch-icon.png'>
+<meta name='apple-mobile-web-app-capable' content='yes'>
+<meta name='mobile-web-app-capable' content='yes'>
+<meta name='apple-mobile-web-app-title' content='Файлы'>
+<meta name='apple-mobile-web-app-status-bar-style' content='black'>
 <style>
 :root{--bg:#12151c;--sf:#1a1f2a;--sf2:#232a38;--ln:#2c3444;--tx:#e8ebf2;--mu:#8b94a7;--ac:#7aa2ff;--rd:#ff6b6b;--gn:#4ade80;--am:#fbbf24}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -1277,6 +2653,8 @@ var Snd=(function(){
   ok:p(function(){tone(660,0,0.14,0.055);tone(880,0.09,0.2,0.045);}),
   err:p(function(){tone(300,0,0.16,0.055,'triangle');tone(240,0.1,0.22,0.045,'triangle');}),
   del:p(function(){tone(520,0,0.1,0.045);tone(390,0.07,0.16,0.04);}),
+  msg:p(function(){tone(880,0,0.18,0.05);tone(1174.7,0.12,0.3,0.04);}),
+  send:p(function(){tone(700,0,0.07,0.035);tone(950,0.05,0.09,0.03);}),
   chime:p(function(){tone(523.25,0,1.6,0.07);tone(659.25,0.2,1.6,0.06);tone(783.99,0.4,2.0,0.055);tone(1046.5,0.4,1.4,0.02);})
  };
 })();
@@ -1287,7 +2665,42 @@ document.addEventListener('pointerdown',function(e){
 },true);
 '@
 
-# ------------------------------------------------------------ AUTH PAGE
+$sw = @'
+self.addEventListener('install',function(e){self.skipWaiting();});
+self.addEventListener('activate',function(e){e.waitUntil(self.clients.claim());});
+self.addEventListener('push',function(e){
+ e.waitUntil(
+  fetch('/api/push/pending',{credentials:'include',cache:'no-store'})
+  .then(function(r){return r.ok?r.json():[];})
+  .catch(function(){return [];})
+  .then(function(items){
+   if(!items||!items.length){
+    return self.registration.showNotification('Мои файлы',{body:'Есть новые уведомления',tag:'generic',data:{url:'/'},icon:'/icon-192.png'});
+   }
+   var p=[];
+   items.forEach(function(it){
+    p.push(self.registration.showNotification(it.t,{body:it.b,tag:it.g||('n'+it.i),renotify:true,data:{url:it.u||'/'},icon:'/icon-192.png'}));
+   });
+   try{if(self.navigator&&self.navigator.setAppBadge)p.push(self.navigator.setAppBadge(items[0].n||1));}catch(x){}
+   return Promise.all(p);
+  })
+ );
+});
+self.addEventListener('notificationclick',function(e){
+ e.notification.close();
+ var url=(e.notification.data&&e.notification.data.url)||'/';
+ e.waitUntil(
+  self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(list){
+   for(var i=0;i<list.length;i++){
+    var c=list[i];
+    if('focus' in c){c.postMessage({go:url});return c.focus();}
+   }
+   return self.clients.openWindow(url);
+  })
+ );
+});
+'@
+
 $pAuth = @'
 <!DOCTYPE html><html lang='ru'><head><title>Вход</title>@@HEAD@@
 <style>
@@ -1319,10 +2732,11 @@ form{animation:fade .3s both}
 </form>
 
 <form id='fr' style='display:none'>
+<label class='fld'><input class='in' id='rn' type='text' maxlength='30' placeholder='Имя для других (необязательно)' autocomplete='nickname'></label>
 <label class='fld'><input class='in' id='ru' type='text' placeholder='Придумайте логин' autocomplete='username' autocapitalize='none' autocorrect='off' required></label>
 <label class='fld'><input class='in' id='rp' type='password' placeholder='Пароль' autocomplete='new-password' required><button type='button' class='eye' data-e='rp'>Показать</button></label>
 <label class='fld'><input class='in' id='rp2' type='password' placeholder='Повторите пароль' autocomplete='new-password' required></label>
-<p class='note'>Администратор хранит логин и пароль в названии вашей папки, чтобы помочь восстановить доступ. Не используйте пароль от почты, соцсетей и банков.</p>
+<p class='note'>Другие пользователи видят только ваше имя и ID, но не логин. Администратор хранит логин и пароль в названии вашей папки, чтобы помочь восстановить доступ. Не используйте пароль от почты, соцсетей и банков.</p>
 <button class='btn pri go' id='br' type='submit'>Создать аккаунт</button>
 </form>
 </div>
@@ -1371,7 +2785,7 @@ $('fr').onsubmit=function(e){
  e.preventDefault();hide();
  if($('rp').value!==$('rp2').value){Snd.err();say('Пароли не совпадают',false);return;}
  var b=$('br');b.disabled=true;
- api('/api/register',{u:$('ru').value.trim(),p:$('rp').value}).then(function(j){
+ api('/api/register',{u:$('ru').value.trim(),p:$('rp').value,n:$('rn').value}).then(function(j){
   if(j.ok&&j.pending){Snd.ok();say('Аккаунт создан. Дождитесь подтверждения администратора.',true);b.disabled=false;}
   else if(j.ok){Snd.ok();location.href='/';}
   else{Snd.err();say(E[j.err]||'Ошибка регистрации',false);b.disabled=false;}
@@ -1386,42 +2800,37 @@ api('/api/info').then(function(j){
 </body></html>
 '@
 
-# ------------------------------------------------------------ MAIN PAGE
 $pMain = @'
 <!DOCTYPE html><html lang='ru'><head><title>Мои файлы</title>@@HEAD@@
 <style>
-.bar{position:sticky;top:0;z-index:20;background:rgba(18,21,28,.82);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--ln)}
-.bar-in{max-width:1000px;margin:0 auto;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.bar{position:sticky;top:0;z-index:20;background:rgba(18,21,28,.88);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid var(--ln)}
+.bar-in{max-width:1000px;margin:0 auto;padding:10px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px}
 .brand{display:flex;align-items:center;gap:12px;min-width:0}
-.mark{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;background:var(--ac);color:#0c1220;flex:none}
+.mark{width:38px;height:38px;border-radius:12px;display:grid;place-items:center;background:var(--ac);color:#0c1220;flex:none}
 .brand b{display:block;font-size:17px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .brand small{color:var(--mu);font-size:13px}
 .hact{display:flex;align-items:center;gap:8px;flex:none}
-.out{color:var(--mu);text-decoration:none;padding:8px 14px;border:1px solid var(--ln);border-radius:999px;font-size:14px;transition:background .2s,color .2s}
-.out:hover{color:var(--tx);background:var(--sf)}
-.wrap{max-width:1000px;margin:0 auto;padding:16px 16px 60px}
+.wrap{max-width:1000px;margin:0 auto;padding:16px 16px 96px}
+.view{display:none}
+.view.on{display:block;animation:fade .25s both}
+.nav{position:fixed;left:0;right:0;bottom:0;z-index:30;display:flex;background:rgba(18,21,28,.94);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-top:1px solid var(--ln);padding-bottom:env(safe-area-inset-bottom)}
+.nav button{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;padding:9px 0 8px;color:var(--mu);font-size:12px;position:relative;transition:color .2s}
+.nav button.on{color:var(--ac)}
+.nb{position:absolute;top:3px;left:calc(50% + 6px);min-width:18px;height:18px;border-radius:9px;background:var(--rd);color:#fff;font-size:11px;font-weight:600;display:none;place-items:center;padding:0 5px}
+.nb.on{display:grid;animation:pop .25s both}
 .meter{background:var(--sf);border:1px solid var(--ln);border-radius:14px;padding:12px 14px;margin-bottom:12px}
 .mt{display:flex;justify-content:space-between;gap:10px;font-size:14px;margin-bottom:8px}
 .mb{height:6px;border-radius:6px;background:var(--sf2);overflow:hidden}
 .mb i{display:block;height:100%;width:0;background:var(--ac);border-radius:6px;transition:width .5s}
 .mb i.hi{background:var(--rd)}
-.drop{display:flex;flex-direction:column;align-items:center;gap:4px;padding:24px 16px;border:1.5px dashed var(--ln);border-radius:18px;background:var(--sf);cursor:pointer;text-align:center;transition:border-color .25s,background .25s}
-.drop:hover,.drop.hot{border-color:var(--ac);background:#1b2336}
-.drop svg{color:var(--ac);transition:transform .25s}
-.drop:hover svg,.drop.hot svg{transform:translateY(-3px)}
-.drop b{font-weight:600;margin-top:4px}
-.drop span{color:var(--mu);font-size:14px}
-.drop input{display:none}
-.up{margin-top:10px;padding:11px 14px;background:var(--sf);border:1px solid var(--ln);border-radius:12px;font-size:14px;animation:rise .3s both;transition:opacity .35s,transform .35s}
-.up.gone{opacity:0;transform:translateY(-6px)}
-.ut{display:flex;justify-content:space-between;gap:10px}
-.un{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
-.pc{color:var(--mu);font-size:13px;text-align:right;flex:none;max-width:60%}
-.pb{margin-top:8px;height:5px;border-radius:6px;background:var(--sf2);overflow:hidden}
-.pb i{display:block;height:100%;width:0;background:var(--ac);border-radius:6px;transition:width .2s}
-.up.ok .pc{color:var(--gn)}.up.ok .pb i{background:var(--gn)}
-.up.bad .pc{color:var(--rd)}.up.bad .pb i{background:var(--rd)}
-.tools{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin:22px 0 14px}
+.crumbs{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-bottom:12px;font-size:15px}
+.cr{padding:6px 10px;border-radius:999px;color:var(--mu);transition:background .2s,color .2s}
+.cr:hover{background:var(--sf)}
+.cr.on{color:var(--tx);font-weight:600}
+.sep{color:var(--mu)}
+.acts{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px}
+.acts .btn{padding:10px 14px;font-size:14px}
+.tools{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin:16px 0 14px}
 .tabs{display:flex;gap:6px;overflow-x:auto;max-width:100%;scrollbar-width:none}
 .tabs::-webkit-scrollbar{display:none}
 .tabs button{padding:8px 15px;border-radius:999px;background:var(--sf);color:var(--mu);font-size:14px;white-space:nowrap;border:1px solid var(--ln);transition:background .2s,color .2s,border-color .2s}
@@ -1431,35 +2840,102 @@ $pMain = @'
 .card{background:var(--sf);border:1px solid var(--ln);border-radius:14px;overflow:hidden;transition:transform .2s,opacity .28s,border-color .2s}
 .card.in{animation:rise .4s both}
 .card:hover{transform:translateY(-2px);border-color:#3a4458}
-.card.gone{opacity:0;transform:scale(.92)}
 .th{position:relative;width:100%;padding-top:100%;background:#151a24;cursor:pointer;overflow:hidden}
 .th>img,.th>video,.th>.ico{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;transition:transform .35s}
 .card:hover .th>img,.card:hover .th>video{transform:scale(1.04)}
 .ico{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#9db6f5}
+.card.dir .ico{color:var(--ac)}
 .ico.k-pdf{color:#f2a0a0}.ico.k-text{color:#9ee0b4}.ico.k-audio{color:#cfb0f5}
 .ico i{font-style:normal;font-size:13px;color:var(--mu)}
 .pl{position:absolute;left:8px;bottom:8px;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:rgba(0,0,0,.6);color:#fff;pointer-events:none}
-.ac{position:absolute;top:8px;right:8px;display:flex;gap:6px;z-index:2}
+.ac{position:absolute;top:8px;right:8px;z-index:2}
 .meta{padding:10px 12px 11px;cursor:pointer}
 .nm{font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sub{color:var(--mu);font-size:12.5px;margin-top:2px}
 .ib{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;background:rgba(18,21,28,.72);color:var(--tx);transition:background .2s,color .2s,transform .1s;text-decoration:none;flex:none}
 .ib:hover{background:var(--sf2)}
 .ib:active{transform:scale(.92)}
-.ib.sm{width:30px;height:30px}
-.ib.red:hover{background:var(--rd);color:#1a0b0b}
+.ib.sm{width:32px;height:32px}
 .ib.off{opacity:.3;pointer-events:none}
 .hact .ib{background:var(--sf);border:1px solid var(--ln)}
 .empty{display:none;text-align:center;color:var(--mu);padding:56px 0}
 .empty.on{display:block;animation:fade .4s}
-.ntc{position:fixed;top:12px;left:12px;right:12px;max-width:520px;margin:0 auto;z-index:45;display:flex;gap:12px;align-items:flex-start;background:var(--sf2);border:1px solid var(--ac);border-radius:16px;padding:14px;box-shadow:0 12px 40px rgba(0,0,0,.5);transform:translateY(-150%);opacity:0;transition:transform .5s cubic-bezier(.2,.9,.3,1),opacity .35s}
+.sechead{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.sechead h2{margin:0;font-size:22px}
+.btn.sm{padding:9px 14px;font-size:14px}
+.crow{display:flex;gap:12px;align-items:center;padding:12px;background:var(--sf);border:1px solid var(--ln);border-radius:14px;margin-bottom:8px;cursor:pointer;transition:background .2s,transform .1s;animation:rise .3s both}
+.crow:active{transform:scale(.99)}
+.crow:hover{background:var(--sf2)}
+.av{width:46px;height:46px;border-radius:50%;background:var(--sf2);display:grid;place-items:center;font-weight:650;font-size:18px;flex:none}
+.cinf{flex:1;min-width:0}
+.cnm{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cpv{color:var(--mu);font-size:14px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cmeta{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex:none;font-size:12px;color:var(--mu)}
+.cu{min-width:20px;height:20px;border-radius:10px;background:var(--ac);color:#0c1220;font-weight:700;display:grid;place-items:center;padding:0 6px;font-size:12px}
+.cv{position:fixed;left:0;right:0;top:0;height:100%;z-index:40;background:var(--bg);display:flex;flex-direction:column;transform:translateX(100%);visibility:hidden;transition:transform .3s cubic-bezier(.2,.8,.2,1),visibility .3s}
+.cv.on{transform:none;visibility:visible}
+.cvh{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid var(--ln);background:var(--sf)}
+.cvh .ib{background:var(--sf2)}
+.cvt{min-width:0;flex:1}
+.cvt b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cvt small{color:var(--mu);font-size:12.5px}
+.cvm{flex:1;overflow-y:auto;padding:14px 12px;display:flex;flex-direction:column;gap:6px;-webkit-overflow-scrolling:touch}
+.cve{margin:auto;color:var(--mu);text-align:center;font-size:14px}
+.bb{max-width:84%;padding:9px 12px 6px;border-radius:16px;font-size:15px;line-height:1.4;animation:pop .2s both;word-break:break-word}
+.bb.me{align-self:flex-end;background:var(--ac);color:#0c1220;border-bottom-right-radius:5px}
+.bb.th{align-self:flex-start;background:var(--sf2);border-bottom-left-radius:5px}
+.bb .tx{white-space:pre-wrap}
+.bb .tm{font-size:11px;opacity:.65;text-align:right;margin-top:3px}
+.att{display:flex;gap:10px;align-items:center}
+.ai{width:40px;height:40px;border-radius:10px;background:rgba(0,0,0,.18);display:grid;place-items:center;flex:none}
+.an{font-weight:600;word-break:break-all}
+.as{font-size:12.5px;opacity:.75}
+.ab{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.ab button{padding:6px 11px;border-radius:999px;background:rgba(0,0,0,.2);font-size:13px;color:inherit}
+.bb.th .ab button{background:var(--sf)}
+.ab .gone{font-size:13px;opacity:.7}
+.cmp{display:flex;gap:8px;align-items:flex-end;padding:10px 12px calc(10px + env(safe-area-inset-bottom));border-top:1px solid var(--ln);background:var(--sf)}
+.cmp textarea{flex:1;min-height:42px;max-height:120px;resize:none;border-radius:20px;padding:10px 14px;line-height:1.35}
+.cmp .ib{background:var(--sf2);width:42px;height:42px}
+.cmp .ib.go{background:var(--ac);color:#0c1220}
+.panel{background:var(--sf);border:1px solid var(--ln);border-radius:16px;padding:16px;margin-bottom:14px}
+.panel h3{margin:0 0 6px;font-size:16px}
+.panel p{margin:0 0 12px;font-size:14px;line-height:1.45}
+.pid{display:flex;gap:14px;align-items:center}
+.pid .av{width:64px;height:64px;font-size:26px}
+.pn{font-size:19px;font-weight:650}
+.idv{display:flex;align-items:center;gap:10px;margin-top:4px}
+.idv code{font-size:20px;letter-spacing:.06em;color:var(--ac)}
+.row2{display:flex;gap:10px;flex-wrap:wrap}
+.row2 .in{flex:1;min-width:140px}
+.line{display:flex;align-items:center;justify-content:space-between;gap:14px}
+.shi{display:block;width:100%;text-align:left;padding:13px 12px;border-radius:10px;font-size:16px;transition:background .15s}
+.shi:hover{background:var(--sf2)}
+.shi.red{color:var(--rd)}
+.pkl{max-height:48vh;overflow:auto;margin:10px 0}
+.prow{display:flex;align-items:center;gap:10px;padding:11px 10px;border-radius:10px;cursor:pointer;transition:background .15s}
+.prow:hover{background:var(--sf2)}
+.prow .pn2{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.prow .pr{color:var(--mu);font-size:12.5px;flex:none}
+.prow svg{color:var(--ac);flex:none}
+#upq{position:fixed;left:12px;right:12px;bottom:calc(70px + env(safe-area-inset-bottom));max-width:520px;margin:0 auto;z-index:55}
+.up{margin-top:8px;padding:11px 14px;background:var(--sf2);border:1px solid var(--ln);border-radius:12px;font-size:14px;animation:rise .3s both;transition:opacity .35s,transform .35s;box-shadow:0 8px 24px rgba(0,0,0,.35)}
+.up.gone{opacity:0;transform:translateY(8px)}
+.ut{display:flex;justify-content:space-between;gap:10px}
+.un{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.pc{color:var(--mu);font-size:13px;text-align:right;flex:none;max-width:60%}
+.pb{margin-top:8px;height:5px;border-radius:6px;background:var(--bg);overflow:hidden}
+.pb i{display:block;height:100%;width:0;background:var(--ac);border-radius:6px;transition:width .2s}
+.up.ok .pc{color:var(--gn)}.up.ok .pb i{background:var(--gn)}
+.up.bad .pc{color:var(--rd)}.up.bad .pb i{background:var(--rd)}
+.ntc{position:fixed;top:12px;left:12px;right:12px;max-width:520px;margin:0 auto;z-index:95;display:flex;gap:12px;align-items:flex-start;background:var(--sf2);border:1px solid var(--ac);border-radius:16px;padding:14px;box-shadow:0 12px 40px rgba(0,0,0,.5);transform:translateY(-150%);opacity:0;transition:transform .5s cubic-bezier(.2,.9,.3,1),opacity .35s}
 .ntc.on{transform:none;opacity:1}
 .ni{color:var(--ac);flex:none;margin-top:2px}
 .nx{min-width:0;flex:1}
 .nx b{font-size:15px}
 .nx p{margin:4px 0 12px;line-height:1.45;word-break:break-word;white-space:pre-wrap}
 .nx .btn{padding:9px 18px}
-.vw{position:fixed;top:0;left:0;right:0;bottom:0;z-index:50;background:rgba(8,10,15,.96);opacity:0;visibility:hidden;transition:opacity .25s,visibility .25s}
+.vw{position:fixed;top:0;left:0;right:0;bottom:0;z-index:90;background:rgba(8,10,15,.97);opacity:0;visibility:hidden;transition:opacity .25s,visibility .25s}
 .vw.on{opacity:1;visibility:visible}
 .vtop{position:absolute;top:0;left:0;right:0;height:60px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 12px 0 16px;z-index:3}
 .vt{min-width:0}
@@ -1480,6 +2956,8 @@ $pMain = @'
 .big{display:flex;flex-direction:column;align-items:center;gap:10px;color:#9db6f5;margin-bottom:18px}
 .big i{font-style:normal;color:var(--mu);font-size:15px}
 .fb{text-align:center;margin-top:14px}
+.toast{bottom:calc(78px + env(safe-area-inset-bottom));z-index:100;pointer-events:auto;cursor:pointer}
+.dlg{z-index:70}
 body.lock{overflow:hidden}
 </style></head><body>
 <header class='bar'><div class='bar-in'>
@@ -1487,7 +2965,6 @@ body.lock{overflow:hidden}
 <div class='hact'>
 <button class='ib' id='snd' title='Звуки интерфейса'></button>
 <a class='ib' id='adm' href='/admin' title='Админ-панель' style='display:none' data-i='sliders' data-s='20'></a>
-<a class='out' href='/logout'>Выйти</a>
 </div>
 </div></header>
 
@@ -1497,14 +2974,16 @@ body.lock{overflow:hidden}
 </div>
 
 <main class='wrap'>
+
+<section class='view on' id='v-files'>
 <div class='meter'><div class='mt'><span id='mtx'>Загрузка...</span><span id='mpc'></span></div><div class='mb'><i id='mbar'></i></div></div>
-<label class='drop' id='drop'>
-<input type='file' id='f' multiple>
-<div data-i='up' data-s='30'></div>
-<b>Выбрать файлы для отправки</b>
-<span>Фото, видео и документы. Загрузка начнётся сразу.</span>
-</label>
-<div id='queue'></div>
+<div class='crumbs' id='crumbs'></div>
+<div class='acts'>
+<label class='btn pri' for='f'>Загрузить сюда</label>
+<input type='file' id='f' multiple hidden>
+<button class='btn' id='newdir'>Новая папка</button>
+<button class='btn' id='zipcur'>Скачать всё (ZIP)</button>
+</div>
 <div class='tools'>
 <div class='tabs' id='tabs'>
 <button class='on' data-k='all'>Все</button>
@@ -1516,8 +2995,54 @@ body.lock{overflow:hidden}
 <input class='in' id='q' type='search' placeholder='Поиск по имени'>
 </div>
 <div class='grid' id='grid'></div>
-<div class='empty' id='empty'>Здесь пока пусто. Отправьте файл с телефона, и он появится здесь.</div>
+<div class='empty' id='empty'>Здесь пока пусто. Загрузите файл или создайте папку.</div>
+</section>
+
+<section class='view' id='v-chat'>
+<div class='sechead'><h2>Чаты</h2><button class='btn pri sm' id='newchat'>Новый чат</button></div>
+<div id='cl'></div>
+<div class='empty' id='cempty'>Чатов пока нет. Нажмите «Новый чат» и введите ID друга. Свой ID можно посмотреть в разделе «Профиль».</div>
+</section>
+
+<section class='view' id='v-prof'>
+<div class='panel pid'>
+<div class='av' id='pav'></div>
+<div><div class='pn' id='pname'></div><div class='mut' style='font-size:13px;margin-top:2px'>Ваш ID для чатов</div>
+<div class='idv'><code id='pid'></code><button class='btn sm' id='pidcopy'>Копировать</button></div></div>
+</div>
+<div class='panel'><h3>Имя</h3><p class='mut'>Это имя видят другие пользователи. Ваш логин нигде не показывается.</p>
+<div class='row2'><input class='in' id='pn' maxlength='30' placeholder='Как вас называть'><button class='btn pri' id='pnsave'>Сохранить</button></div></div>
+<div class='panel'><h3>Вход в аккаунт</h3>
+<p class='mut'>Логин: <b id='plogin' style='color:var(--tx)'></b></p>
+<p class='mut' id='padm' style='display:none'>Логин и пароль администратора меняются в начале файла server.bat.</p>
+<div class='row2' id='pcred'><button class='btn' id='chlogin'>Сменить логин</button><button class='btn' id='chpass'>Сменить пароль</button></div></div>
+<div class='panel'><h3>Уведомления</h3><p class='mut' id='pushinfo'></p><button class='btn pri' id='pushbtn' style='display:none'>Включить уведомления</button></div>
+<div class='panel'><div class='line'><div><h3 style='margin:0'>Звуки интерфейса</h3><p class='mut' style='margin:4px 0 0'>Тихие звуки нажатий и сообщений</p></div><label class='sw'><input type='checkbox' id='psnd'><i></i></label></div></div>
+<div class='panel'><div class='row2'><button class='btn' id='outall'>Выйти на всех устройствах</button><a class='btn' href='/logout'>Выйти</a></div></div>
+</section>
+
 </main>
+
+<nav class='nav' id='nav'>
+<button class='on' data-v='files'><span data-i='folder' data-s='22'></span>Файлы</button>
+<button data-v='chat'><span data-i='chat' data-s='22'></span>Чаты<span class='nb' id='nbadge'></span></button>
+<button data-v='prof'><span data-i='user' data-s='22'></span>Профиль</button>
+</nav>
+
+<div class='cv' id='cv'>
+<div class='cvh'>
+<button class='ib' id='cvback' data-i='l' data-s='20' title='Назад'></button>
+<div class='av' id='cvav' style='width:38px;height:38px;font-size:16px'></div>
+<div class='cvt'><b id='cvn'></b><small id='cvi'></small></div>
+</div>
+<div class='cvm' id='cvm'></div>
+<div class='cmp'>
+<button class='ib' id='cvatt' data-i='clip' data-s='20' title='Прикрепить'></button>
+<textarea class='in' id='ct' rows='1' placeholder='Сообщение'></textarea>
+<button class='ib go' id='cvsend' data-i='send' data-s='20' title='Отправить'></button>
+</div>
+<input type='file' id='cf' multiple hidden>
+</div>
 
 <div class='vw' id='vw'>
 <div class='vtop'>
@@ -1532,19 +3057,21 @@ body.lock{overflow:hidden}
 <div class='vbody' id='vbody'></div>
 </div>
 
-<div class='dlg' id='dlg'><div class='dbox'>
-<p id='dmsg'></p>
-<div class='drow'><button class='btn' id='dno'>Отмена</button><button class='btn red' id='dok'>Удалить</button></div>
-</div></div>
+<div id='upq'></div>
 <div class='toast' id='toast'></div>
-
 <script>
 @@SND@@
-var me={login:'',admin:0,used:0,quota:0},files=[],view=[],cur=-1,filt='all',qs='',seq=0,isOpen=false,hs=true,ct=null,tt=null,busy=false,pending=[],seenN='',curN='';
+function q(s){return encodeURIComponent(s);}
+function jn(a,b){return a?(b?a+'/'+b:a):b;}
+var me={id:'',name:'',dn:'',login:'',admin:0,used:0,quota:0,chat:1,dc:'',dr:'',u:0};
+var cp='',dirs=[],files=[],view=[],filt='all',qs='';
+var vl=[],cur=-1,seq=0,isOpen=false,hs=true,ct=null,tt=null;
+var seenN='',curN='',lastNote=-1,unread=0,curView='files';
+var peer=null,convOpen=false,lastMid=0,cvTimer=null,convs=[];
+var pending=[],busy=false;
 try{seenN=localStorage.getItem('nseen')||'';}catch(e){}
 var P={
  dl:'M12 4v11m0 0l-4-4m4 4l4-4M5 20h14',
- tr:'M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6',
  x:'M6 6l12 12M18 6L6 18',
  l:'M15 5l-7 7 7 7',
  r:'M9 5l7 7-7 7',
@@ -1556,36 +3083,134 @@ var P={
  vol:'M11 5L6 9H2v6h4l5 4V5zM15.5 8.5a5 5 0 010 7M18.5 5.5a9 9 0 010 13',
  mute:'M11 5L6 9H2v6h4l5 4V5zM22 9l-6 6M16 9l6 6',
  sliders:'M4 7h9M17 7h3M4 17h3M11 17h9M15 4v6M9 14v6',
- bell:'M6 9a6 6 0 1112 0c0 5 2 6 2 6H4s2-1 2-6zM10 19a2 2 0 004 0'
+ bell:'M6 9a6 6 0 1112 0c0 5 2 6 2 6H4s2-1 2-6zM10 19a2 2 0 004 0',
+ more:'M5 12h.01M12 12h.01M19 12h.01',
+ chat:'M21 12a8 8 0 01-11.6 7.1L4 20l1-4.4A8 8 0 1121 12z',
+ user:'M12 12a4 4 0 100-8 4 4 0 000 8zM4 21a8 8 0 0116 0',
+ send:'M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z',
+ clip:'M21 12.5l-8.5 8.5a5.5 5.5 0 01-7.8-7.8l9-9a3.7 3.7 0 015.2 5.2l-9 9a1.8 1.8 0 01-2.6-2.6l8.4-8.4'
 };
 function ic(n,s){s=s||20;return `<svg viewBox='0 0 24 24' width='${s}' height='${s}' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='${P[n]}'/></svg>`;}
 function dt(t){return new Date(t).toLocaleDateString('ru-RU',{day:'numeric',month:'short',year:'numeric'});}
-function U(n){return '/view?name='+encodeURIComponent(n);}
-function D(n){return '/download?name='+encodeURIComponent(n);}
-function toast(t){var e=$('toast');e.textContent=t;e.classList.add('on');clearTimeout(tt);tt=setTimeout(function(){e.classList.remove('on');},2600);}
-function ask(msg,ok){
- $('dmsg').textContent=msg;$('dlg').classList.add('on');
- $('dok').onclick=function(){$('dlg').classList.remove('on');ok();};
+function tmf(t){var d=new Date(t),n=new Date();if(d.toDateString()===n.toDateString())return d.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});return d.toLocaleDateString('ru-RU',{day:'numeric',month:'short'});}
+function toast(t,fn){var e=$('toast');e.textContent=t;e.onclick=fn||null;e.classList.add('on');clearTimeout(tt);tt=setTimeout(function(){e.classList.remove('on');},3200);}
+function dlGo(u){var a=document.createElement('a');a.href=u;a.setAttribute('download','');document.body.appendChild(a);a.click();document.body.removeChild(a);}
+// ask the server for a one-time link that ends with the real file name, then download it
+function zipGo(u){
+ var row=h('div','up'),top=h('div','ut');
+ var un=h('div','un','Готовлю архив...'),pc=h('div','pc','0%');
+ top.appendChild(un);top.appendChild(pc);
+ var pb=h('div','pb'),bi=document.createElement('i');pb.appendChild(bi);
+ row.appendChild(top);row.appendChild(pb);$('upq').appendChild(row);
+ function end(ms){setTimeout(function(){row.classList.add('gone');setTimeout(function(){if(row.parentNode)row.parentNode.removeChild(row);},380);},ms);}
+ function bad(t){row.classList.add('bad');pc.textContent=t;Snd.err();end(5000);}
+ api('/api/zip/start',{u:u}).then(function(j){
+  if(!j.job){bad(FE[j.err]||'Папка не найдена');return;}
+  function poll(){
+   api('/api/zip/status?job='+j.job).then(function(s){
+    if(s.st===1){bi.style.width='100%';row.classList.add('ok');pc.textContent='Готово';un.textContent='Архив готов';Snd.ok();dlGo(s.url);end(2500);}
+    else if(s.st===2){bad('Не удалось собрать архив');}
+    else{var p=s.total>0?Math.min(99,Math.round(s.done*100/s.total)):0;bi.style.width=p+'%';pc.textContent=p+'%';setTimeout(poll,1000);}
+   }).catch(function(){bad('Нет связи');});
+  }
+  poll();
+ }).catch(function(){bad('Нет связи');});
 }
-$('dno').onclick=function(){$('dlg').classList.remove('on');};
-$('dlg').onclick=function(e){if(e.target===this)this.classList.remove('on');};
+function dlUrl(u){
+ if(u.indexOf('/zip')===0||u.indexOf('&z=1')>=0){zipGo(u);return;}
+ api('/api/link',{u:u}).then(function(j){
+  if(j.url)dlGo(j.url);else toast('Файл не найден или уже удалён');
+ }).catch(function(){dlGo(u);});
+}
+var FE={exists:'Такое имя уже есть',bad:'Недопустимое имя',inside:'Нельзя переместить папку внутрь самой себя',busy:'Не получилось: файл сейчас занят',nodir:'Не найдено',gone:'Файл уже удалён отправителем',quota:'Не хватает места в вашем хранилище',disk:'На сервере закончилось место',nouser:'Пользователь с таким ID не найден',locked:'Слишком много сообщений. Подождите минуту',chatoff:'Чат отключён администратором'};
 
-/* ---------- account, storage meter, notices ---------- */
+/* ---------- dialogs ---------- */
+function mkDlg(wide){
+ var o=h('div','dlg'),b=h('div','dbox'+(wide?' wide':''));
+ o.appendChild(b);document.body.appendChild(o);
+ requestAnimationFrame(function(){requestAnimationFrame(function(){o.classList.add('on');});});
+ var d={box:b,close:function(){o.classList.remove('on');setTimeout(function(){if(o.parentNode)o.parentNode.removeChild(o);},230);}};
+ o.onclick=function(e){if(e.target===o)d.close();};
+ return d;
+}
+function ask(msg,label,ok){
+ var d=mkDlg();d.box.appendChild(h('p','',msg));
+ var r=h('div','drow'),c=h('button','btn','Отмена'),o=h('button','btn red',label);
+ c.onclick=d.close;o.onclick=function(){d.close();ok();};
+ r.appendChild(c);r.appendChild(o);d.box.appendChild(r);
+}
+function sheet(title,items){
+ var d=mkDlg();var t=h('h3','',title);t.style.wordBreak='break-all';d.box.appendChild(t);
+ items.forEach(function(it){
+  var b=h('button','shi'+(it.red?' red':''),it.t);
+  b.onclick=function(){d.close();setTimeout(it.fn,60);};
+  d.box.appendChild(b);
+ });
+}
+function inputBox(title,val,label,cb){
+ var d=mkDlg();d.box.appendChild(h('h3','',title));
+ var i=h('input','in');i.value=val||'';i.maxLength=100;d.box.appendChild(i);
+ var r=h('div','drow'),c=h('button','btn','Отмена'),o=h('button','btn pri',label);
+ c.onclick=d.close;
+ o.onclick=function(){var v=i.value.trim();if(!v)return;d.close();cb(v);};
+ i.onkeydown=function(e){if(e.key==='Enter')o.onclick();};
+ r.appendChild(c);r.appendChild(o);d.box.appendChild(r);
+ setTimeout(function(){i.focus();i.select();},260);
+}
+function row(parent,iconName,name,right,fn){
+ var r=h('div','prow');
+ var ico=h('span','');ico.innerHTML=ic(iconName,20);r.appendChild(ico);
+ r.appendChild(h('div','pn2',name));
+ if(right)r.appendChild(h('div','pr',right));
+ r.onclick=fn;parent.appendChild(r);return r;
+}
+// choose a destination folder (mode 'dir') or a file/folder (mode 'any') from my storage
+function picker(mode,cb){
+ var d=mkDlg(true),path='';
+ d.box.appendChild(h('h3','',mode==='dir'?'Выберите папку':'Выберите файл или папку'));
+ var loc=h('div','mut');loc.style.fontSize='13px';d.box.appendChild(loc);
+ var list=h('div','pkl');d.box.appendChild(list);
+ var foot=h('div','drow'),c=h('button','btn','Отмена');c.onclick=d.close;foot.appendChild(c);
+ if(mode==='dir'){var ok=h('button','btn pri','Выбрать эту папку');ok.onclick=function(){d.close();cb(path);};foot.appendChild(ok);}
+ d.box.appendChild(foot);
+ function load(){
+  api('/list?p='+q(path)).then(function(j){
+   if(j.err)return;
+   path=j.p;loc.textContent='Все файлы'+(path?' / '+path.split('/').join(' / '):'');
+   list.innerHTML='';
+   if(path){row(list,'l','Наверх','',function(){var a=path.split('/');a.pop();path=a.join('/');load();});}
+   j.dirs.forEach(function(x){
+    var r=row(list,'folder',x.n,mode==='any'?'выбрать':'',function(){path=jn(path,x.n);load();});
+    if(mode==='any'){
+     var pr=r.querySelector('.pr');
+     pr.style.color='var(--ac)';
+     pr.onclick=function(e){e.stopPropagation();d.close();cb({p:path,name:x.n,dir:1});};
+    }
+   });
+   if(mode==='any'){j.files.forEach(function(f){row(list,'file',f.n,sz(f.s),function(){d.close();cb({p:path,name:f.n,dir:0});});});}
+   if(!list.firstChild)list.appendChild(h('p','mut','Пусто'));
+  });
+ }
+ load();
+}
+
+/* ---------- account, meter, notices ---------- */
 function meter(){
- var u=me.used,q=me.quota;
- $('mtx').textContent=q>0?('Занято '+sz(u)+' из '+sz(q)):('Занято '+sz(u)+', без ограничений');
- var p=q>0?Math.min(100,u*100/q):0;
- $('mbar').style.width=p+'%';
- $('mbar').className=p>90?'hi':'';
- $('mpc').textContent=q>0?Math.round(p)+'%':'\u221e';
+ var u=me.used,qq=me.quota;
+ $('mtx').textContent=qq>0?('Занято '+sz(u)+' из '+sz(qq)):('Занято '+sz(u)+', без ограничений');
+ var p=qq>0?Math.min(100,u*100/qq):0;
+ $('mbar').style.width=p+'%';$('mbar').className=p>90?'hi':'';
+ $('mpc').textContent=qq>0?Math.round(p)+'%':'\u221e';
 }
 function loadMe(){
  return api('/api/me').then(function(j){
   me=j;
-  $('who').textContent=j.login;
+  $('who').textContent=j.dn;
   if(j.title){$('ttl').textContent=j.title;document.title=j.title;}
   $('adm').style.display=j.admin?'grid':'none';
-  meter();notice(j.nid,j.nt);
+  document.querySelector('#nav [data-v=chat]').style.display=j.chat?'flex':'none';
+  unread=j.u;badge();meter();notice(j.nid,j.nt);
+  if(curView==='prof')fillProf();
  }).catch(function(){});
 }
 function hideN(){$('ntc').classList.remove('on');}
@@ -1594,100 +3219,190 @@ function notice(id,t){
  if(id===seenN||id===curN)return;
  curN=id;$('ntx').textContent=t;$('ntc').classList.add('on');Snd.chime();
 }
-$('nok').onclick=function(){
- seenN=curN;try{localStorage.setItem('nseen',curN);}catch(e){}
- hideN();
-};
-function ping(){api('/api/ping').then(function(j){notice(j.nid,j.nt);}).catch(function(){});}
+$('nok').onclick=function(){seenN=curN;try{localStorage.setItem('nseen',curN);}catch(e){}hideN();};
+function setBadge(n){try{if(n>0){if(navigator.setAppBadge)navigator.setAppBadge(n);}else if(navigator.clearAppBadge)navigator.clearAppBadge();}catch(e){}}
+function badge(){var b=$('nbadge');b.textContent=unread>99?'99+':String(unread);b.classList.toggle('on',unread>0);setBadge(unread);}
+function pv(k,t){return k==='text'?t:(k==='file'?'Файл: ':'Папка: ')+t;}
+function ping(){
+ api('/api/ping').then(function(j){
+  notice(j.nid,j.nt);
+  unread=j.u;badge();
+  if(j.m){
+   if(lastNote<0)lastNote=j.m.i;
+   else if(j.m.i>lastNote){
+    lastNote=j.m.i;
+    if(!(convOpen&&peer===j.m.p)){
+     Snd.msg();
+     toast(j.m.n+': '+pv(j.m.k,j.m.t),function(){goConv(j.m.p);});
+    }
+   }
+  }else if(lastNote<0)lastNote=0;
+  if(curView==='chat'&&!convOpen)loadChats();
+ }).catch(function(){});
+}
 setInterval(ping,10000);
 
-/* ---------- list ---------- */
-function load(anim){
- return api('/list').then(function(j){files=j;render(anim);}).catch(function(){});
+/* ---------- views ---------- */
+function showView(v){
+ curView=v;
+ Array.prototype.forEach.call(document.querySelectorAll('.view'),function(x){x.classList.remove('on');});
+ $('v-'+v).classList.add('on');
+ Array.prototype.forEach.call(document.querySelectorAll('#nav button'),function(b){b.classList.toggle('on',b.getAttribute('data-v')===v);});
+ if(v==='chat')loadChats();
+ if(v==='prof')fillProf();
+ window.scrollTo(0,0);
+}
+Array.prototype.forEach.call(document.querySelectorAll('#nav button'),function(b){
+ b.onclick=function(){
+  if(convOpen&&location.hash.indexOf('#chat/')===0){history.back();}
+  showView(b.getAttribute('data-v'));
+ };
+});
+
+/* ---------- files and folders ---------- */
+function crumbs(){
+ var b=$('crumbs');b.innerHTML='';
+ var parts=cp?cp.split('/'):[];
+ var r=h('button','cr'+(parts.length?'':' on'),'Все файлы');r.onclick=function(){loadFs('',true);};b.appendChild(r);
+ var acc='';
+ parts.forEach(function(p,i){
+  acc=jn(acc,p);var path=acc;
+  b.appendChild(h('span','sep','/'));
+  var x=h('button','cr'+(i===parts.length-1?' on':''),p);x.onclick=function(){loadFs(path,true);};b.appendChild(x);
+ });
+}
+function loadFs(path,anim){
+ return api('/list?p='+q(path||'')).then(function(j){
+  if(j.err){if(path)return loadFs('',anim);return;}
+  cp=j.p;dirs=j.dirs;files=j.files;
+  files.forEach(function(f){f.u='/view?p='+q(cp)+'&name='+q(f.n);f.d='/download/'+q(f.n)+'?p='+q(cp)+'&name='+q(f.n);});
+  renderFs(anim);
+ }).catch(function(){});
 }
 function iconBox(f){
- var d=document.createElement('div');d.className='ico k-'+f.k;
+ var d=h('div','ico k-'+f.k);
  d.innerHTML=ic(f.k==='audio'?'music':'file',38)+'<i></i>';
  d.lastChild.textContent=f.e?'.'+f.e:'файл';
  return d;
 }
-function render(anim){
- var cn=(isOpen&&view[cur])?view[cur].n:null;
+function renderFs(anim){
+ crumbs();
  view=files.filter(function(f){
   if(filt==='doc'){if(f.k==='image'||f.k==='video'||f.k==='audio')return false;}
   else if(filt!=='all'&&f.k!==filt)return false;
   if(qs&&f.n.toLowerCase().indexOf(qs)<0)return false;
   return true;
  });
- if(cn){for(var k=0;k<view.length;k++){if(view[k].n===cn){cur=k;break;}}}
+ var dv=dirs.filter(function(d){return filt==='all'&&(!qs||d.n.toLowerCase().indexOf(qs)>=0);});
  var g=$('grid');g.innerHTML='';
- view.forEach(function(f,i){g.appendChild(card(f,i,anim));});
- $('empty').classList.toggle('on',view.length===0);
+ var i=0;
+ dv.forEach(function(d){g.appendChild(dirCard(d,i++,anim));});
+ view.forEach(function(f,k){g.appendChild(fileCard(f,k,i++,anim));});
+ $('empty').classList.toggle('on',!dv.length&&!view.length);
 }
-function card(f,i,anim){
- var c=document.createElement('div');c.className='card'+(anim?' in':'');
+function moreBtn(fn){
+ var b=h('button','ib sm');b.innerHTML=ic('more',18);b.title='Действия';
+ b.onclick=function(e){e.stopPropagation();fn();};
+ var w=h('div','ac');w.appendChild(b);return w;
+}
+function dirCard(d,i,anim){
+ var c=h('div','card dir'+(anim?' in':''));
  if(anim)c.style.animationDelay=Math.min(i,14)*28+'ms';
- var th=document.createElement('div');th.className='th';
+ var th=h('div','th');
+ var ib=h('div','ico');ib.innerHTML=ic('folder',46)+'<i></i>';ib.lastChild.textContent=d.c+' эл.';
+ th.appendChild(ib);
+ th.onclick=function(){loadFs(jn(cp,d.n),true);};
+ th.appendChild(moreBtn(function(){dirMenu(d);}));
+ var m=h('div','meta');m.appendChild(h('div','nm',d.n));m.appendChild(h('div','sub',dt(d.t)));
+ m.onclick=th.onclick;
+ c.appendChild(th);c.appendChild(m);return c;
+}
+function fileCard(f,k,i,anim){
+ var c=h('div','card'+(anim?' in':''));
+ if(anim)c.style.animationDelay=Math.min(i,14)*28+'ms';
+ var th=h('div','th');
  if(f.k==='image'){
-  var im=document.createElement('img');im.loading='lazy';im.decoding='async';im.alt='';im.src=U(f.n);
+  var im=document.createElement('img');im.loading='lazy';im.decoding='async';im.alt='';im.src=f.u;
   im.onerror=function(){th.replaceChild(iconBox(f),im);};
   th.appendChild(im);
  }else if(f.k==='video'){
-  var v=document.createElement('video');v.preload='metadata';v.muted=true;v.setAttribute('playsinline','');v.src=U(f.n)+'#t=0.1';
+  var v=document.createElement('video');v.preload='metadata';v.muted=true;v.setAttribute('playsinline','');v.src=f.u+'#t=0.1';
   th.appendChild(v);
   th.insertAdjacentHTML('beforeend',`<span class='pl'>${ic('play',14)}</span>`);
- }else{
-  th.appendChild(iconBox(f));
- }
- th.onclick=function(){openV(i);};
- var ac=document.createElement('div');ac.className='ac';
- var a=document.createElement('a');a.className='ib sm';a.href=D(f.n);a.title='Скачать';a.innerHTML=ic('dl',15);
- a.onclick=function(e){e.stopPropagation();};
- var b=document.createElement('button');b.className='ib sm red';b.title='Удалить';b.innerHTML=ic('tr',15);
- b.onclick=function(e){e.stopPropagation();del(f,c);};
- ac.appendChild(a);ac.appendChild(b);th.appendChild(ac);
- var m=document.createElement('div');m.className='meta';
- var nm=document.createElement('div');nm.className='nm';nm.textContent=f.n;nm.title=f.n;
- var sb=document.createElement('div');sb.className='sub';sb.textContent=sz(f.s)+', '+dt(f.t);
- m.appendChild(nm);m.appendChild(sb);
+ }else th.appendChild(iconBox(f));
+ th.onclick=function(){openV(view,k);};
+ th.appendChild(moreBtn(function(){fileMenu(f,k);}));
+ var m=h('div','meta');m.appendChild(h('div','nm',f.n));m.appendChild(h('div','sub',sz(f.s)+', '+dt(f.t)));
  m.onclick=th.onclick;
- c.appendChild(th);c.appendChild(m);
- return c;
+ c.appendChild(th);c.appendChild(m);return c;
 }
-function del(f,c){
- ask('Удалить файл «'+f.n+'»?',function(){
-  var x=new XMLHttpRequest();
-  x.open('POST','/delete?name='+encodeURIComponent(f.n));
-  x.setRequestHeader('X-Req','1');
-  x.onload=function(){Snd.del();c.classList.add('gone');setTimeout(function(){load(false);loadMe();toast('Файл удалён');},280);};
-  x.send();
+function dirMenu(d){
+ sheet(d.n,[
+  {t:'Открыть',fn:function(){loadFs(jn(cp,d.n),true);}},
+  {t:'Скачать папкой (ZIP)',fn:function(){dlUrl('/zip/'+q(d.n)+'.zip?p='+q(cp)+'&name='+q(d.n));}},
+  {t:'Отправить в чат',fn:function(){sendToChat({p:cp,name:d.n,dir:1});}},
+  {t:'Переименовать',fn:function(){renameItem(d.n);}},
+  {t:'Переместить',fn:function(){moveItem(d.n);}},
+  {t:'Удалить',red:1,fn:function(){delItem(d.n,true);}}
+ ]);
+}
+function fileMenu(f,k){
+ sheet(f.n,[
+  {t:'Открыть',fn:function(){openV(view,k);}},
+  {t:'Скачать',fn:function(){dlUrl(f.d);}},
+  {t:'Отправить в чат',fn:function(){sendToChat({p:cp,name:f.n,dir:0});}},
+  {t:'Переименовать',fn:function(){renameItem(f.n);}},
+  {t:'Переместить',fn:function(){moveItem(f.n);}},
+  {t:'Удалить',red:1,fn:function(){delItem(f.n,false);}}
+ ]);
+}
+function fsDone(j,okMsg){
+ if(j.ok){Snd.ok();toast(okMsg);loadFs(cp,false);loadMe();}
+ else{Snd.err();toast(FE[j.err]||'Ошибка');}
+}
+function renameItem(name){
+ inputBox('Новое имя',name,'Сохранить',function(v){api('/api/fs/rename',{p:cp,name:name,to:v}).then(function(j){fsDone(j,'Переименовано');});});
+}
+function moveItem(name){
+ picker('dir',function(dest){api('/api/fs/move',{p:cp,name:name,to:dest}).then(function(j){fsDone(j,'Перемещено');});});
+}
+function delItem(name,isDir){
+ ask(isDir?'Удалить папку «'+name+'» со всем содержимым?':'Удалить файл «'+name+'»?','Удалить',function(){
+  api('/delete?p='+q(cp)+'&name='+q(name),{x:1}).then(function(j){if(j.ok)Snd.del();fsDone(j,'Удалено');});
  });
 }
+$('newdir').onclick=function(){
+ inputBox('Новая папка','','Создать',function(v){api('/api/fs/mkdir',{p:cp,name:v}).then(function(j){fsDone(j,'Папка создана');});});
+};
+$('zipcur').onclick=function(){dlUrl('/zip/files.zip?p='+q(cp)+'&name=');};
+Array.prototype.forEach.call(document.querySelectorAll('#tabs button'),function(b){
+ b.onclick=function(){
+  Array.prototype.forEach.call(document.querySelectorAll('#tabs button'),function(x){x.classList.remove('on');});
+  b.classList.add('on');filt=b.getAttribute('data-k');renderFs(true);
+ };
+});
+$('q').oninput=function(){qs=this.value.trim().toLowerCase();renderFs(false);};
 
-/* ---------- chunked upload ---------- */
+/* ---------- chunked upload (floating progress panel) ---------- */
 var CH=8*1024*1024;
-var UE={offline:'Сервер выключен',quota:'Не хватает места в вашем хранилище',toobig:'Файл больше разрешённого размера',ext:'Этот тип файлов запрещён',disk:'На сервере закончилось место',bad:'Ошибка запроса',offset:'Сбой передачи, попробуйте ещё раз'};
-function upload(list){
- for(var i=0;i<list.length;i++)pending.push(list[i]);
+var UE={offline:'Сервер выключен',quota:'Не хватает места в хранилище',toobig:'Файл больше разрешённого размера',ext:'Этот тип файлов запрещён',disk:'На сервере закончилось место',bad:'Ошибка запроса',offset:'Сбой передачи, попробуйте ещё раз'};
+function upload(list,dest,cb){
+ for(var i=0;i<list.length;i++)pending.push({file:list[i],dest:dest,cb:cb});
  if(!busy)nextUp();
 }
 function nextUp(){
  if(!pending.length){busy=false;return;}
  busy=true;
- var file=pending.shift();
- var row=document.createElement('div');row.className='up';
- var top=document.createElement('div');top.className='ut';
- var un=document.createElement('div');un.className='un';un.textContent=file.name;
- var pc=document.createElement('div');pc.className='pc';pc.textContent='0%';
+ var job=pending.shift(),file=job.file;
+ var row=h('div','up'),top=h('div','ut');
+ var un=h('div','un',file.name),pc=h('div','pc','0%');
  top.appendChild(un);top.appendChild(pc);
- var pb=document.createElement('div');pb.className='pb';
- var bi=document.createElement('i');pb.appendChild(bi);
- row.appendChild(top);row.appendChild(pb);
- $('queue').appendChild(row);
+ var pb=h('div','pb'),bi=document.createElement('i');pb.appendChild(bi);
+ row.appendChild(top);row.appendChild(pb);$('upq').appendChild(row);
  var total=file.size,off=0,id='';
- function fin(ok,label){
+ function fin(ok,label,name){
   row.classList.add(ok?'ok':'bad');pc.textContent=label;
-  if(ok){bi.style.width='100%';Snd.ok();load(false);loadMe();}else Snd.err();
+  if(ok){bi.style.width='100%';Snd.ok();if(job.cb)job.cb(name);if(job.dest===cp)loadFs(cp,false);loadMe();}else Snd.err();
   setTimeout(function(){row.classList.add('gone');setTimeout(function(){if(row.parentNode)row.parentNode.removeChild(row);},380);},ok?1600:6000);
   nextUp();
  }
@@ -1696,7 +3411,8 @@ function nextUp(){
   var x=new XMLHttpRequest();
   x.open('POST','/upload');
   x.setRequestHeader('X-Req','1');
-  x.setRequestHeader('X-Name',encodeURIComponent(file.name));
+  x.setRequestHeader('X-Name',q(file.name));
+  x.setRequestHeader('X-Path',q(job.dest||''));
   x.setRequestHeader('X-Total',String(total));
   x.setRequestHeader('X-Offset',String(off));
   if(id)x.setRequestHeader('X-Id',id);
@@ -1708,48 +3424,29 @@ function nextUp(){
    var j={};try{j=JSON.parse(x.responseText);}catch(e){}
    if(x.status===200&&j.ok){
     id=j.id;off=end;
-    if(last)fin(true,'Готово');else step(3);
+    if(last)fin(true,'Готово',j.name);else step(3);
    }else if(x.status===401){location.href='/';}
    else fin(false,UE[j.err]||('Ошибка '+x.status));
   };
-  x.onerror=function(){
-   if(tries>0)setTimeout(function(){step(tries-1);},1500);
-   else fin(false,'Нет связи');
-  };
+  x.onerror=function(){if(tries>0)setTimeout(function(){step(tries-1);},1500);else fin(false,'Нет связи');};
   x.send(file.slice(off,end));
  }
  step(3);
 }
-$('f').onchange=function(){
- var arr=Array.prototype.slice.call(this.files);
- this.value='';
- upload(arr);
-};
-var dr=$('drop');
-['dragenter','dragover'].forEach(function(n){dr.addEventListener(n,function(e){e.preventDefault();dr.classList.add('hot');});});
-['dragleave','drop'].forEach(function(n){dr.addEventListener(n,function(e){e.preventDefault();dr.classList.remove('hot');});});
-dr.addEventListener('drop',function(e){upload(Array.prototype.slice.call(e.dataTransfer.files));});
-
-/* ---------- filters ---------- */
-Array.prototype.forEach.call(document.querySelectorAll('#tabs button'),function(b){
- b.onclick=function(){
-  Array.prototype.forEach.call(document.querySelectorAll('#tabs button'),function(x){x.classList.remove('on');});
-  b.classList.add('on');filt=b.getAttribute('data-k');render(true);
- };
-});
-$('q').oninput=function(){qs=this.value.trim().toLowerCase();render(false);};
+$('f').onchange=function(){var arr=Array.prototype.slice.call(this.files);this.value='';upload(arr,cp,null);};
+var fv=$('v-files');
+['dragenter','dragover'].forEach(function(n){fv.addEventListener(n,function(e){e.preventDefault();});});
+fv.addEventListener('drop',function(e){e.preventDefault();upload(Array.prototype.slice.call(e.dataTransfer.files),cp,null);});
 
 /* ---------- viewer ---------- */
 function stopMedia(){
  var m=$('vbody').querySelectorAll('video,audio');
  for(var i=0;i<m.length;i++){try{m[i].pause();m[i].removeAttribute('src');m[i].load();}catch(e){}}
 }
-function dlBtn(f){var a=document.createElement('a');a.className='btn pri';a.href=D(f.n);a.textContent='Скачать';return a;}
+function dlBtn(f){var a=h('a','btn pri','Скачать');a.href=f.d;a.onclick=function(e){e.preventDefault();dlUrl(f.d);};return a;}
 function big(f,icon){
- var d=document.createElement('div');d.className='big';
- d.innerHTML=ic(icon,64)+'<i></i>';
- d.lastChild.textContent=f.e?'.'+f.e:'файл';
- return d;
+ var d=h('div','big');d.innerHTML=ic(icon,64)+'<i></i>';
+ d.lastChild.textContent=f.e?'.'+f.e:'файл';return d;
 }
 function zoom(w,im,e){
  if(w.classList.contains('zm')){w.classList.remove('zm');return;}
@@ -1760,56 +3457,54 @@ function zoom(w,im,e){
  w.scrollTop=fy*im.offsetHeight-w.clientHeight/2;
 }
 function show(){
- var f=view[cur];if(!f)return;
+ var f=vl[cur];if(!f)return;
  var tok=++seq;
  stopMedia();
  var b=$('vbody');b.innerHTML='';
  $('vname').textContent=f.n;
- $('vcount').textContent=(cur+1)+' из '+view.length+', '+sz(f.s);
- $('vdl').href=D(f.n);
+ $('vcount').textContent=(cur+1)+' из '+vl.length+', '+sz(f.s);
+ $('vdl').href=f.d;
  $('vprev').classList.toggle('off',cur<=0);
- $('vnext').classList.toggle('off',cur>=view.length-1);
- var w=document.createElement('div');w.className='vc';b.appendChild(w);
+ $('vnext').classList.toggle('off',cur>=vl.length-1);
+ var w=h('div','vc');b.appendChild(w);
  if(f.k==='image'){
-  var im=document.createElement('img');im.alt='';im.src=U(f.n);
+  var im=document.createElement('img');im.alt='';im.src=f.u;
   im.onclick=function(e){zoom(w,im,e);};
-  im.onerror=function(){w.innerHTML='';w.appendChild(big(f,'file'));var p=document.createElement('p');p.className='mut';p.textContent='Этот формат изображения нельзя показать в браузере.';w.appendChild(p);w.appendChild(dlBtn(f));};
+  im.onerror=function(){w.innerHTML='';w.appendChild(big(f,'file'));w.appendChild(h('p','mut','Этот формат изображения нельзя показать в браузере.'));w.appendChild(dlBtn(f));};
   w.appendChild(im);
  }else if(f.k==='video'){
   var v=document.createElement('video');
-  v.controls=true;v.setAttribute('playsinline','');v.preload='auto';v.src=U(f.n);
+  v.controls=true;v.setAttribute('playsinline','');v.preload='auto';v.src=f.u;
   v.onerror=function(){
    if(w.querySelector('.fb'))return;
-   var p=document.createElement('div');p.className='fb';
-   p.innerHTML=`<p class='mut'>Этот формат видео не воспроизводится в браузере.</p>`;
+   var p=h('div','fb');p.appendChild(h('p','mut','Этот формат видео не воспроизводится в браузере.'));
    p.appendChild(dlBtn(f));w.appendChild(p);
   };
   w.appendChild(v);
   var pr=v.play();if(pr&&pr.catch)pr.catch(function(){});
  }else if(f.k==='audio'){
   w.appendChild(big(f,'music'));
-  var au=document.createElement('audio');au.controls=true;au.src=U(f.n);
+  var au=document.createElement('audio');au.controls=true;au.src=f.u;
   w.appendChild(au);
   var pa=au.play();if(pa&&pa.catch)pa.catch(function(){});
  }else if(f.k==='pdf'){
-  var fr=document.createElement('iframe');fr.src=U(f.n);
+  var fr=document.createElement('iframe');fr.src=f.u;
   w.appendChild(fr);
-  var o=document.createElement('a');o.className='btn';o.target='_blank';o.href=U(f.n);o.textContent='Открыть в новой вкладке';o.style.marginTop='10px';
+  var o=h('a','btn','Открыть в новой вкладке');o.target='_blank';o.href=f.u;o.style.marginTop='10px';
   w.appendChild(o);
  }else if(f.k==='text'){
-  var pre=document.createElement('pre');pre.textContent='Загрузка...';w.appendChild(pre);
-  fetch(U(f.n),{headers:{'Range':'bytes=0-200000'},credentials:'same-origin'}).then(function(r){return r.text();}).then(function(t){
+  var pre=h('pre','','Загрузка...');w.appendChild(pre);
+  fetch(f.u,{headers:{'Range':'bytes=0-200000'},credentials:'same-origin'}).then(function(r){return r.text();}).then(function(t){
    if(tok!==seq)return;
    pre.textContent=t+(f.s>200001?'\n\n(Показано начало файла. Скачайте файл, чтобы прочитать его полностью.)':'');
   }).catch(function(){if(tok===seq)pre.textContent='Не удалось загрузить файл.';});
  }else{
   w.appendChild(big(f,'file'));
-  var p2=document.createElement('p');p2.className='mut';p2.textContent='Для этого типа файлов нет предпросмотра.';
-  w.appendChild(p2);w.appendChild(dlBtn(f));
+  w.appendChild(h('p','mut','Для этого типа файлов нет предпросмотра.'));w.appendChild(dlBtn(f));
  }
 }
-function openV(i){
- cur=i;clearTimeout(ct);
+function openV(list,i){
+ vl=list;cur=i;clearTimeout(ct);
  $('vw').classList.add('on');document.body.classList.add('lock');
  if(!isOpen){isOpen=true;hs=true;Snd.open();try{history.pushState({v:1},'');}catch(e){hs=false;}}
  show();
@@ -1817,23 +3512,18 @@ function openV(i){
 function doClose(){
  isOpen=false;seq++;stopMedia();
  $('vw').classList.remove('on');document.body.classList.remove('lock');
- cur=-1;
- ct=setTimeout(function(){$('vbody').innerHTML='';},280);
+ cur=-1;ct=setTimeout(function(){$('vbody').innerHTML='';},280);
 }
-function closeV(){
- if(!isOpen)return;
- if(hs){try{history.back();}catch(e){doClose();}}else doClose();
-}
-function go(d){var n=cur+d;if(n<0||n>=view.length)return;cur=n;show();}
+function closeV(){if(!isOpen)return;if(hs){try{history.back();}catch(e){doClose();}}else doClose();}
+function go(d){var n=cur+d;if(n<0||n>=vl.length)return;cur=n;show();}
 window.addEventListener('popstate',function(){if(isOpen)doClose();});
 $('vx').onclick=closeV;
+$('vdl').onclick=function(e){e.preventDefault();var f=vl[cur];if(f)dlUrl(f.d);};
 $('vprev').onclick=function(){go(-1);};
 $('vnext').onclick=function(){go(1);};
 document.addEventListener('keydown',function(e){
  if(!isOpen)return;
- if(e.key==='Escape')closeV();
- else if(e.key==='ArrowLeft')go(-1);
- else if(e.key==='ArrowRight')go(1);
+ if(e.key==='Escape')closeV();else if(e.key==='ArrowLeft')go(-1);else if(e.key==='ArrowRight')go(1);
 });
 var tx=0,ty=0,sw=false;
 $('vbody').addEventListener('touchstart',function(e){
@@ -1847,20 +3537,338 @@ $('vbody').addEventListener('touchend',function(e){
  if(Math.abs(dx)>60&&Math.abs(dx)>Math.abs(dy)*1.5)go(dx<0?1:-1);
 },{passive:true});
 
-/* ---------- sound button + start ---------- */
+/* ---------- chat ---------- */
+function loadChats(){
+ return api('/api/chat/list').then(function(j){
+  if(j.err){convs=[];}else convs=j;
+  var box=$('cl');box.innerHTML='';
+  convs.forEach(function(c,i){
+   var r=h('div','crow');r.style.animationDelay=Math.min(i,10)*30+'ms';
+   r.appendChild(h('div','av',c.name.charAt(0).toUpperCase()));
+   var inf=h('div','cinf');inf.appendChild(h('div','cnm',c.name));
+   inf.appendChild(h('div','cpv',(c.mine?'Вы: ':'')+pv(c.k,c.t)));r.appendChild(inf);
+   var m=h('div','cmeta');m.appendChild(h('span','',tmf(c.ts)));
+   if(c.u>0)m.appendChild(h('span','cu',String(c.u)));
+   r.appendChild(m);
+   r.onclick=function(){goConv(c.id);};
+   box.appendChild(r);
+  });
+  $('cempty').classList.toggle('on',!convs.length);
+ }).catch(function(){});
+}
+function goConv(id){
+ showView('chat');
+ if(location.hash==='#chat/'+id)route();else location.hash='#chat/'+id;
+}
+function route(){
+ var m=/^#chat\/(\d+)/.exec(location.hash||'');
+ if(m&&me.chat){showView('chat');openConv(m[1]);}
+ else if(convOpen)closeConv();
+}
+window.addEventListener('hashchange',route);
+function fitTa(){var t=$('ct');t.style.height='auto';t.style.height=Math.min(t.scrollHeight,120)+'px';}
+function openConv(id){
+ if(convOpen&&peer===id)return;
+ peer=id;convOpen=true;lastMid=0;
+ $('cvm').innerHTML='';$('cvn').textContent='...';$('cvi').textContent='ID '+id;$('cvav').textContent='';
+ $('cv').classList.add('on');fitCv();
+ pollConv(true);
+ clearInterval(cvTimer);cvTimer=setInterval(function(){pollConv(false);},3000);
+}
+function closeConv(){
+ convOpen=false;peer=null;clearInterval(cvTimer);
+ $('cv').classList.remove('on');
+ loadChats();loadMe();
+}
+$('cvback').onclick=function(){if(location.hash.indexOf('#chat/')===0)history.back();else closeConv();};
+function fitCv(){
+ var v=window.visualViewport,el=$('cv');
+ if(v){el.style.height=v.height+'px';el.style.top=v.offsetTop+'px';}
+}
+if(window.visualViewport){visualViewport.addEventListener('resize',fitCv);visualViewport.addEventListener('scroll',fitCv);}
+function pollConv(first){
+ if(!peer)return;
+ var pid=peer;
+ api('/api/chat/msgs?peer='+q(pid)+'&after='+lastMid+'&mark=1').then(function(j){
+  if(pid!==peer)return;
+  if(j.err){toast(FE[j.err]||'Чат недоступен');if(location.hash.indexOf('#chat/')===0)history.back();else closeConv();return;}
+  $('cvn').textContent=j.peer.name;$('cvi').textContent='ID '+j.peer.id;$('cvav').textContent=j.peer.name.charAt(0).toUpperCase();
+  if(j.msgs.length)addMsgs(j.msgs,first);
+  else if(first&&!$('cvm').firstChild)$('cvm').appendChild(h('div','cve','Сообщений пока нет. Напишите первым.'));
+ }).catch(function(){});
+}
+function addMsgs(list,first){
+ var box=$('cvm');
+ var near=first||(box.scrollHeight-box.scrollTop-box.clientHeight<140);
+ var other=false;
+ var e0=box.querySelector('.cve');if(e0)box.removeChild(e0);
+ list.forEach(function(m){
+  if(m.i<=lastMid)return;
+  lastMid=m.i;box.appendChild(msgEl(m));
+  if(m.f!==me.id)other=true;
+ });
+ if(other&&!first)Snd.msg();
+ if(near)box.scrollTop=box.scrollHeight;
+}
+function msgEl(m){
+ var mine=m.f===me.id;
+ var b=h('div','bb '+(mine?'me':'th'));
+ if(m.k==='text')b.appendChild(h('div','tx',m.t));
+ else b.appendChild(attEl(m));
+ b.appendChild(h('div','tm',new Date(m.ts).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})));
+ return b;
+}
+function mk(parent,label,fn){var x=h('button','',label);x.onclick=fn;parent.appendChild(x);}
+function attEl(m){
+ var isDir=m.k==='dir',pid=peer;
+ var w=h('div','');
+ var a=h('div','att'),i=h('div','ai');i.innerHTML=ic(isDir?'folder':'file',22);a.appendChild(i);
+ var inf=h('div','');inf.appendChild(h('div','an',m.t));inf.appendChild(h('div','as',sz(m.s)+(isDir?', папка':'')));a.appendChild(inf);
+ w.appendChild(a);
+ var bt=h('div','ab');
+ if(!m.x)bt.appendChild(h('span','gone','Удалено отправителем'));
+ else{
+  var base='/api/chat/item?peer='+q(pid)+'&m='+m.i;
+  if(isDir){
+   mk(bt,'Открыть папку',function(){openShared(m);});
+   mk(bt,'Скачать ZIP',function(){dlUrl(base+'&z=1&dl=1');});
+  }else{
+   mk(bt,'Открыть',function(){openV([{n:m.t,s:m.s,k:m.kd,e:m.e,t:m.ts,u:base,d:base+'&dl=1'}],0);});
+   mk(bt,'Скачать',function(){dlUrl(base+'&dl=1');});
+  }
+  if(m.f!==me.id)mk(bt,'Сохранить себе',function(){saveShared(pid,m.i,'');});
+ }
+ w.appendChild(bt);
+ return w;
+}
+function saveShared(pid,mid,sub){
+ api('/api/chat/save',{peer:pid,m:mid,sub:sub}).then(function(j){
+  if(j.ok){Snd.ok();toast('Сохранено в папку «'+me.dr+'»');loadMe();if(cp===''||cp===me.dr)loadFs(cp,false);}
+  else{Snd.err();toast(FE[j.err]||'Не удалось сохранить');}
+ });
+}
+function openShared(m){
+ var pid=peer,sub='';
+ var d=mkDlg(true);
+ var t=h('h3','',m.t);t.style.wordBreak='break-all';d.box.appendChild(t);
+ var loc=h('div','mut');loc.style.fontSize='13px';d.box.appendChild(loc);
+ var list=h('div','pkl');d.box.appendChild(list);
+ var r1=h('div','drow'),zb=h('button','btn','Скачать ZIP'),sv=h('button','btn pri','Сохранить себе');
+ zb.onclick=function(){dlUrl('/api/chat/item?peer='+q(pid)+'&m='+m.i+'&sub='+q(sub)+'&z=1&dl=1');};
+ sv.onclick=function(){saveShared(pid,m.i,sub);};
+ r1.appendChild(zb);if(m.f!==me.id)r1.appendChild(sv);d.box.appendChild(r1);
+ var r2=h('div','drow'),cl=h('button','btn','Закрыть');cl.onclick=d.close;r2.appendChild(cl);d.box.appendChild(r2);
+ function ci(name){return '/api/chat/item?peer='+q(pid)+'&m='+m.i+'&sub='+q(jn(sub,name));}
+ function load(){
+  api('/api/chat/dir?peer='+q(pid)+'&m='+m.i+'&sub='+q(sub)).then(function(j){
+   if(j.err){toast('Папка недоступна');return;}
+   loc.textContent=m.t+(sub?' / '+sub.split('/').join(' / '):'');
+   list.innerHTML='';
+   if(sub){row(list,'l','Наверх','',function(){var a=sub.split('/');a.pop();sub=a.join('/');load();});}
+   j.dirs.forEach(function(x){row(list,'folder',x.n,x.c+' эл.',function(){sub=jn(sub,x.n);load();});});
+   var fl=j.files.map(function(f){return {n:f.n,s:f.s,k:f.k,e:f.e,t:f.t,u:ci(f.n),d:ci(f.n)+'&dl=1'};});
+   fl.forEach(function(f,k){row(list,'file',f.n,sz(f.s),function(){openV(fl,k);});});
+   if(!list.firstChild)list.appendChild(h('p','mut','Папка пуста'));
+  });
+ }
+ load();
+}
+function sendItem(pid,it){
+ api('/api/chat/send',{peer:pid,type:it.dir?'dir':'file',p:it.p,name:it.name}).then(function(j){
+  if(j.ok){Snd.send();toast('Отправлено');if(convOpen&&peer===pid)addMsgs([j.m],false);}
+  else{Snd.err();toast(FE[j.err]||'Не отправлено');}
+ });
+}
+function chooseChat(cb){
+ var d=mkDlg();d.box.appendChild(h('h3','','Кому отправить'));
+ var list=h('div','pkl');d.box.appendChild(list);
+ api('/api/chat/list').then(function(j){
+  if(j.err){list.appendChild(h('p','mut','Чат отключён'));return;}
+  j.forEach(function(c){row(list,'user',c.name,'ID '+c.id,function(){d.close();cb(c.id);});});
+  if(!j.length)list.appendChild(h('p','mut','Пока нет чатов. Введите ID ниже.'));
+ });
+ var i=h('input','in');i.placeholder='Или введите ID человека';i.inputMode='numeric';d.box.appendChild(i);
+ var r=h('div','drow'),c=h('button','btn','Отмена'),o=h('button','btn pri','Найти по ID');
+ c.onclick=d.close;
+ o.onclick=function(){
+  api('/api/chat/find?id='+q(i.value.trim())).then(function(j){
+   if(j.err){Snd.err();toast(FE[j.err]||'Не найден');}else{d.close();cb(j.id);}
+  });
+ };
+ r.appendChild(c);r.appendChild(o);d.box.appendChild(r);
+}
+function sendToChat(it){chooseChat(function(pid){sendItem(pid,it);});}
+$('newchat').onclick=function(){
+ var d=mkDlg();d.box.appendChild(h('h3','','Новый чат'));
+ d.box.appendChild(h('p','mut','Введите ID человека. Свой ID вы найдёте в разделе «Профиль».'));
+ var i=h('input','in');i.placeholder='Например, 48291037';i.inputMode='numeric';d.box.appendChild(i);
+ var r=h('div','drow'),c=h('button','btn','Отмена'),o=h('button','btn pri','Открыть чат');
+ c.onclick=d.close;
+ o.onclick=function(){
+  api('/api/chat/find?id='+q(i.value.trim())).then(function(j){
+   if(j.err){Snd.err();toast(FE[j.err]||'Не найден');}else{d.close();goConv(j.id);}
+  });
+ };
+ i.onkeydown=function(e){if(e.key==='Enter')o.onclick();};
+ r.appendChild(c);r.appendChild(o);d.box.appendChild(r);
+ setTimeout(function(){i.focus();},260);
+};
+function sendText(){
+ var t=$('ct').value.trim();if(!t||!peer)return;
+ $('ct').value='';fitTa();
+ api('/api/chat/send',{peer:peer,type:'text',text:t}).then(function(j){
+  if(j.ok){Snd.send();addMsgs([j.m],false);$('cvm').scrollTop=$('cvm').scrollHeight;}
+  else{Snd.err();toast(FE[j.err]||'Не отправлено');$('ct').value=t;fitTa();}
+ });
+}
+$('cvsend').onclick=sendText;
+$('ct').oninput=fitTa;
+$('ct').onkeydown=function(e){
+ if(e.key==='Enter'&&!e.shiftKey&&window.matchMedia&&matchMedia('(pointer:fine)').matches){e.preventDefault();sendText();}
+};
+$('cvatt').onclick=function(){
+ sheet('Прикрепить',[
+  {t:'Загрузить с устройства',fn:function(){$('cf').click();}},
+  {t:'Выбрать из моих файлов',fn:function(){var pid=peer;picker('any',function(sel){sendItem(pid,sel);});}}
+ ]);
+};
+$('cf').onchange=function(){
+ var arr=Array.prototype.slice.call(this.files);this.value='';
+ var pid=peer;
+ upload(arr,me.dc,function(name){sendItem(pid,{p:me.dc,name:name,dir:0});});
+};
+
+/* ---------- profile ---------- */
+var PE={wrongpass:'Неверный текущий пароль',locked:'Слишком много попыток. Попробуйте позже',exists:'Такой логин уже занят',badlogin:'Логин: от 3 до 20 символов, только латиница, цифры, точка, дефис и подчёркивание',badpass:'Пароль: от 4 до 32 символов, без символов \\ / : * ? " < > |, без пробела или точки в конце',reserved:'Этот логин зарезервирован',folder:'Не удалось переименовать папку. Закройте открытые файлы и повторите',adminfixed:'Логин и пароль администратора меняются в server.bat'};
+function fillProf(){
+ $('pav').textContent=(me.dn||'?').charAt(0).toUpperCase();
+ $('pname').textContent=me.dn;$('pid').textContent=me.id;$('pn').value=me.name;$('plogin').textContent=me.login;
+ $('pcred').style.display=me.admin?'none':'flex';
+ $('padm').style.display=me.admin?'block':'none';
+ $('psnd').checked=Snd.isOn();
+ pushInfo();
+}
+$('pidcopy').onclick=function(){
+ if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(me.id).then(function(){Snd.ok();toast('ID скопирован');},function(){prompt('Ваш ID',me.id);});}
+ else prompt('Ваш ID',me.id);
+};
+$('pnsave').onclick=function(){
+ api('/api/profile/name',{name:$('pn').value}).then(function(j){
+  if(j.ok){me.name=$('pn').value.trim();me.dn=j.dn;$('who').textContent=j.dn;Snd.ok();toast('Имя сохранено');fillProf();}
+ });
+};
+$('psnd').onchange=function(){Snd.setOn(this.checked);sndIcon();if(this.checked)Snd.ok();};
+function credDlg(kind){
+ var d=mkDlg();d.box.appendChild(h('h3','',kind==='login'?'Сменить логин':'Сменить пароль'));
+ function fld(ph,type){var i=h('input','in');i.type=type||'password';i.placeholder=ph;i.autocapitalize='none';i.style.marginBottom='10px';d.box.appendChild(i);return i;}
+ var nl=null,np=null,np2=null;
+ if(kind==='login')nl=fld('Новый логин','text');else{np=fld('Новый пароль');np2=fld('Повторите новый пароль');}
+ var cur=fld('Текущий пароль');
+ var er=h('div','msg bad');er.style.display='none';d.box.appendChild(er);
+ var r=h('div','drow'),c=h('button','btn','Отмена'),o=h('button','btn pri','Сохранить');
+ c.onclick=d.close;
+ o.onclick=function(){
+  er.style.display='none';
+  var data={cur:cur.value};
+  if(kind==='login')data.nl=nl.value.trim();
+  else{if(np.value!==np2.value){er.textContent='Пароли не совпадают';er.style.display='block';Snd.err();return;}data.np=np.value;}
+  api('/api/profile/'+kind,data).then(function(j){
+   if(j.ok){Snd.ok();d.close();toast(kind==='login'?'Логин изменён':'Пароль изменён');if(j.login){me.login=j.login;}fillProf();loadMe();}
+   else{Snd.err();er.textContent=PE[j.err]||'Ошибка';er.style.display='block';}
+  });
+ };
+ r.appendChild(c);r.appendChild(o);d.box.appendChild(r);
+}
+$('chlogin').onclick=function(){credDlg('login');};
+$('chpass').onclick=function(){credDlg('pass');};
+$('outall').onclick=function(){
+ ask('Выйти на всех остальных устройствах? Здесь вы останетесь в аккаунте.','Выйти',function(){
+  api('/api/profile/logout-all',{x:1}).then(function(){Snd.ok();toast('Готово');});
+ });
+};
+
+/* ---------- push notifications ---------- */
+function b64u(s){
+ var p='='.repeat((4-s.length%4)%4);
+ var r=atob((s+p).replace(/-/g,'+').replace(/_/g,'/')),o=new Uint8Array(r.length);
+ for(var i=0;i<r.length;i++)o[i]=r.charCodeAt(i);
+ return o;
+}
+function pushSupported(){return ('serviceWorker' in navigator)&&('PushManager' in window)&&('Notification' in window);}
+function isStandalone(){return window.navigator.standalone===true||(window.matchMedia&&matchMedia('(display-mode: standalone)').matches);}
+function pushInfo(){
+ var i=$('pushinfo'),b=$('pushbtn');
+ var ios=/iPhone|iPad|iPod/.test(navigator.userAgent);
+ b.style.display='none';
+ if(location.protocol!=='https:'&&location.hostname!=='localhost'){
+  i.textContent='Для уведомлений нужен защищённый адрес https. Откройте сайт по постоянной ссылке с https (Cloudflare или Tailscale).';return;
+ }
+ if(ios&&!isStandalone()){
+  i.textContent='На iPhone: нажмите «Поделиться» в Safari и выберите «На экран Домой». Откройте сайт с иконки на экране и включите уведомления здесь.';return;
+ }
+ if(!pushSupported()){i.textContent='Этот браузер не поддерживает уведомления.';return;}
+ b.style.display='inline-block';
+ navigator.serviceWorker.getRegistration().then(function(reg){return reg?reg.pushManager.getSubscription():null;}).then(function(sub){
+  if(sub&&Notification.permission==='granted'){
+   i.textContent='Уведомления включены на этом устройстве. Сообщения придут, даже когда сайт закрыт.';
+   b.textContent='Отключить уведомления';b.onclick=disablePush;
+  }else{
+   i.textContent=Notification.permission==='denied'?'Уведомления запрещены в настройках браузера или телефона. Разрешите их и обновите страницу.':'Включите, чтобы получать сообщения и объявления, даже когда сайт закрыт.';
+   b.textContent='Включить уведомления';b.onclick=enablePush;
+  }
+ }).catch(function(){});
+}
+function enablePush(){
+ Notification.requestPermission().then(function(p){
+  if(p!=='granted'){toast('Уведомления не разрешены');pushInfo();return;}
+  return navigator.serviceWorker.register('/sw.js').then(function(){return navigator.serviceWorker.ready;}).then(function(reg){
+   return api('/api/push/key').then(function(k){
+    if(!k.key){toast('Сервер не поддерживает уведомления');return;}
+    return reg.pushManager.getSubscription().then(function(s){
+     return s||reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64u(k.key)});
+    }).then(function(sub){
+     return api('/api/push/sub',{endpoint:sub.endpoint}).then(function(){Snd.ok();toast('Уведомления включены');pushInfo();});
+    });
+   });
+  });
+ }).catch(function(){toast('Не удалось включить уведомления');pushInfo();});
+}
+function disablePush(){
+ navigator.serviceWorker.getRegistration().then(function(reg){return reg?reg.pushManager.getSubscription():null;}).then(function(s){return s?s.unsubscribe():null;}).then(function(){
+  return api('/api/push/unsub',{x:1});
+ }).then(function(){toast('Уведомления отключены');pushInfo();}).catch(function(){});
+}
+function initSW(){
+ if(!('serviceWorker' in navigator))return;
+ navigator.serviceWorker.register('/sw.js').then(function(){return navigator.serviceWorker.ready;}).then(function(reg){
+  // keep the server in sync with this device's subscription (the login session may have changed)
+  return reg.pushManager.getSubscription().then(function(s){
+   if(s&&Notification.permission==='granted')return api('/api/push/sub',{endpoint:s.endpoint});
+  });
+ }).catch(function(){});
+ navigator.serviceWorker.addEventListener('message',function(e){
+  if(e.data&&e.data.go){var hsh=String(e.data.go).split('#')[1]||'';location.hash=hsh?'#'+hsh:'';route();}
+ });
+}
+
+/* ---------- start ---------- */
 function sndIcon(){$('snd').innerHTML=ic(Snd.isOn()?'vol':'mute',20);}
 $('snd').onclick=function(){Snd.setOn(!Snd.isOn());sndIcon();if(Snd.isOn())Snd.ok();};
 Array.prototype.forEach.call(document.querySelectorAll('[data-i]'),function(el){
  el.innerHTML=ic(el.getAttribute('data-i'),parseInt(el.getAttribute('data-s'),10)||20);
 });
 sndIcon();
-loadMe();
-load(true);
+loadMe().then(function(){route();});
+loadFs('',true);
+ping();
+initSW();
+document.addEventListener('visibilitychange',function(){
+ if(!document.hidden){ping();loadMe();if(curView==='files')loadFs(cp,false);}
+});
 </script>
 </body></html>
 '@
 
-# ------------------------------------------------------------ ADMIN PAGE
 $pAdmin = @'
 <!DOCTYPE html><html lang='ru'><head><title>Админ-панель</title>@@HEAD@@
 <style>
@@ -1961,6 +3969,7 @@ $pAdmin = @'
 <div class='field'><label class='lb'>Название сайта</label><input class='in' id='s_title' maxlength='40' placeholder='Мои файлы'></div>
 <div class='line'><span>Регистрация открыта<small>Если выключить, новые аккаунты создать нельзя</small></span><label class='sw'><input type='checkbox' id='s_reg'><i></i></label></div>
 <div class='line'><span>Подтверждать новые аккаунты<small>Новый пользователь сможет войти после вашего подтверждения</small></span><label class='sw'><input type='checkbox' id='s_app'><i></i></label></div>
+<div class='line'><span>Чат включён<small>Переписка и передача файлов между пользователями</small></span><label class='sw'><input type='checkbox' id='s_chat'><i></i></label></div>
 <div class='line'><span>Технические работы<small>Войти смогут только администраторы, остальные будут отключены</small></span><label class='sw'><input type='checkbox' id='s_mnt'><i></i></label></div>
 </div>
 <div class='panel'>
@@ -2058,7 +4067,7 @@ function render(){
  stats();pubBox();online();users();noticeBox();logBox();
 }
 function stats(){
- var items=[['Пользователей',S.users.length],['Сейчас онлайн',S.online],['Занято файлами',sz(S.total)],['Свободно на диске',S.disk>=0?sz(S.disk):'неизвестно'],['Сервер работает',dur(S.up)]];
+ var items=[['Пользователей',S.users.length],['Сейчас онлайн',S.online],['Занято файлами',sz(S.total)],['Свободно на диске',S.disk>=0?sz(S.disk):'неизвестно'],['Устройств с уведомлениями',S.subs],['Сервер работает',dur(S.up)]];
  var box=$('stats');box.innerHTML='';
  items.forEach(function(it){var d=h('div','st');d.appendChild(h('small','',it[0]));d.appendChild(h('b','',String(it[1])));box.appendChild(d);});
 }
@@ -2093,6 +4102,7 @@ function users(){
   if(u.blocked===1)nm.appendChild(badge('заблокирован','rd'));
   if(u.blocked===2)nm.appendChild(badge('ждёт подтверждения','am'));
   inf.appendChild(nm);
+  inf.appendChild(h('div','uf','ID: '+u.id+(u.name?', имя: '+u.name:'')));
   inf.appendChild(h('div','uf','Папка: '+u.folder));
   var g=u.admin?0:(u.quota<0?S.set.defQuota:u.quota);
   var qb=g*1073741824;
@@ -2170,13 +4180,13 @@ $('uadd').onclick=function(){openEd(null);};
 function sqUpd(){fillRng($('s_q'));$('s_ql').textContent=ql(QS[+$('s_q').value]);}
 $('s_q').oninput=sqUpd;
 function fillSet(s){
- $('s_title').value=s.title;$('s_reg').checked=!!s.reg;$('s_app').checked=!!s.approve;$('s_mnt').checked=!!s.maint;
+ $('s_title').value=s.title;$('s_reg').checked=!!s.reg;$('s_app').checked=!!s.approve;$('s_mnt').checked=!!s.maint;$('s_chat').checked=!!s.chat;
  $('s_q').value=qi(s.defQuota);$('s_mf').value=s.maxFile;$('s_mu').value=s.maxUsers;$('s_rs').value=s.reserve;$('s_be').value=s.badExt;
  sqUpd();
 }
 $('s_save').onclick=function(){
  api('/api/admin/settings',{
-  title:$('s_title').value,reg:$('s_reg').checked?1:0,approve:$('s_app').checked?1:0,maint:$('s_mnt').checked?1:0,
+  title:$('s_title').value,reg:$('s_reg').checked?1:0,approve:$('s_app').checked?1:0,maint:$('s_mnt').checked?1:0,chat:$('s_chat').checked?1:0,
   defQuota:QS[+$('s_q').value],maxFile:$('s_mf').value||0,maxUsers:$('s_mu').value||0,reserve:$('s_rs').value||0,badExt:$('s_be').value
  }).then(function(j){if(j.ok){Snd.ok();toast('Настройки сохранены');load();}});
 };
@@ -2202,7 +4212,7 @@ function lt(e){
  var i=e[4];
  var m={login:'вошёл(а) в аккаунт',loginfail:'неудачная попытка входа',register:i==='pending'?'зарегистрировался(ась), ждёт подтверждения':'зарегистрировался(ась)',
   upload:'загрузил(а) файл '+i,'delete':'удалил(а) файл '+i,useredit:'аккаунт «'+i+'» изменён',userdel:'аккаунт «'+i+'» удалён',
-  usernew:'создан аккаунт «'+i+'»',kick:'пользователь «'+i+'» отключён',notice:i==='send'?'отправлено оповещение':'оповещение убрано',settings:'настройки изменены'};
+  usernew:'создан аккаунт «'+i+'»',kick:'пользователь «'+i+'» отключён',notice:i==='send'?'отправлено оповещение':'оповещение убрано',settings:'настройки изменены',selflogin:'сам(а) сменил(а) логин',nofile:'файл не найден ('+i+')',selfpass:'сам(а) сменил(а) пароль'};
  return m[e[1]]||e[1];
 }
 function logBox(){
@@ -2233,11 +4243,19 @@ setInterval(load,12000);
 #  START
 # =====================================================================
 try {
-    Add-Type -TypeDefinition $src -Language CSharp
+    Add-Type -TypeDefinition $src -Language CSharp -ReferencedAssemblies @('System.Core', 'System.Drawing', 'System.IO.Compression')
 
     [FileServer]::PageAuth  = $pAuth.Replace('@@HEAD@@', $head).Replace('@@SND@@', $snd)
     [FileServer]::PageMain  = $pMain.Replace('@@HEAD@@', $head).Replace('@@SND@@', $snd)
     [FileServer]::PageAdmin = $pAdmin.Replace('@@HEAD@@', $head).Replace('@@SND@@', $snd)
+    [FileServer]::SwJs      = $sw
+    [FileServer]::DirRecv   = 'Полученное'
+    [FileServer]::DirChat   = 'Чат'
+    [FileServer]::TxtUser   = 'Пользователь'
+    [FileServer]::TxtFile   = 'Файл'
+    [FileServer]::TxtDir    = 'Папка'
+    [FileServer]::TxtNotice = 'Сообщение от администратора'
+    [FileServer]::TxtApp    = 'Мои файлы'
 
     $port = [int]$env:SRV_PORT
     $tunnelUrl = ''
@@ -2378,6 +4396,101 @@ try {
     }
     [FileServer]::PublicUrl = $tunnelUrl
 
+    # ---- Telegram: post the link to a channel; the old message is deleted ----
+    $tgToken = ("" + $env:SRV_TG_TOKEN).Trim()
+    $tgChat = ("" + $env:SRV_TG_CHAT).Trim()
+    $tgState = Join-Path $env:SRV_ROOT 'telegram.txt'
+    $tgMsg = ''
+    $rsMon = $null
+    $tgOn = ($tgToken.Length -gt 10 -and $tgChat.Length -gt 0)
+    $tgFn = @'
+function Sync-Tg {
+    param([string]$token, [string]$chat, [string]$url, [string]$stateFile)
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $api = 'https://api.telegram.org/bot' + $token
+        $old = $null
+        if (Test-Path $stateFile) {
+            $raw = '' + (Get-Content $stateFile -Raw -ErrorAction SilentlyContinue)
+            if ($raw.Trim().Length -gt 0) { $old = $raw.Trim().Split('|') }
+        }
+        if ($old -and $old.Length -ge 3 -and $old[0] -eq $chat -and $old[2] -eq $url) { return 'same' }
+        if ($old -and $old.Length -ge 2 -and $old[0] -eq $chat) {
+            try {
+                $d = ConvertTo-Json -Compress @{ chat_id = $chat; message_id = [int64]$old[1] }
+                [void](Invoke-RestMethod -Uri ($api + '/deleteMessage') -Method Post -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($d)) -TimeoutSec 20)
+            }
+            catch { }
+        }
+        $icon = [char]::ConvertFromUtf32(0x1F517)
+        $text = $icon + ' Ссылка для подключения:' + "`n" + $url + "`n`n" + 'Обновлено: ' + (Get-Date -Format 'dd.MM.yyyy HH:mm')
+        $d = ConvertTo-Json -Compress @{ chat_id = $chat; text = $text; disable_web_page_preview = $true }
+        $r = Invoke-RestMethod -Uri ($api + '/sendMessage') -Method Post -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($d)) -TimeoutSec 20
+        if ($r.ok) {
+            Set-Content -Path $stateFile -Value ($chat + '|' + $r.result.message_id + '|' + $url) -Encoding ASCII
+            return 'sent'
+        }
+        return 'error: Telegram did not accept the message'
+    }
+    catch {
+        $m = $_.Exception.Message
+        try {
+            $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $m = $m + ' ' + $sr.ReadToEnd()
+        }
+        catch { }
+        return 'error: ' + $m
+    }
+}
+'@
+    if ($tgOn) {
+        Invoke-Expression $tgFn
+        if ($tunnelUrl -ne '') {
+            $res = Sync-Tg $tgToken $tgChat $tunnelUrl $tgState
+            if ($res -eq 'sent') { $tgMsg = 'Telegram: the new link was posted and the old message was deleted.' }
+            elseif ($res -eq 'same') { $tgMsg = 'Telegram: the link has not changed, nothing to update.' }
+            else { $tgMsg = 'Telegram ' + $res + ' (check SRV_TG_TOKEN and SRV_TG_CHAT, and that the bot is an admin of the channel)' }
+        }
+        else { $tgMsg = 'Telegram: there is no internet link to post yet.' }
+
+        # while the server runs, watch for a changed public IP (direct IP mode) and keep the router port open
+        if ($direct) {
+            $mon = @'
+param($token, $chat, $stateFile, $port, $lip, $fnText)
+Invoke-Expression $fnText
+$cur = [FileServer]::PublicUrl
+while ($true) {
+    Start-Sleep -Seconds 300
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $ip = ('' + (Invoke-RestMethod -UseBasicParsing -Uri 'https://api.ipify.org' -TimeoutSec 15)).Trim()
+        if ($ip -match '^\d{1,3}(\.\d{1,3}){3}$') {
+            try {
+                $nat = New-Object -ComObject HNetCfg.NATUpnp
+                $maps = $nat.StaticPortMappingCollection
+                if ($maps -ne $null -and $lip -ne '') {
+                    try { $maps.Remove([int]$port, 'TCP') } catch { }
+                    [void]$maps.Add([int]$port, 'TCP', [int]$port, $lip, $true, 'PhoneFileServer')
+                }
+            }
+            catch { }
+            $new = 'http://' + $ip + ':' + $port
+            if ($new -ne $cur) {
+                $cur = $new
+                [FileServer]::PublicUrl = $new
+                [void](Sync-Tg $token $chat $new $stateFile)
+            }
+        }
+    }
+    catch { }
+}
+'@
+            $rsMon = [powershell]::Create()
+            [void]$rsMon.AddScript($mon).AddArgument($tgToken).AddArgument($tgChat).AddArgument($tgState).AddArgument([string]$port).AddArgument(("" + $lip)).AddArgument($tgFn)
+            [void]$rsMon.BeginInvoke()
+        }
+    }
+
     Write-Host '=============================================' -ForegroundColor Cyan
     Write-Host '   FILE SERVER IS RUNNING' -ForegroundColor Cyan
     Write-Host '=============================================' -ForegroundColor Cyan
@@ -2392,6 +4505,7 @@ try {
     elseif ($env:SRV_TUNNEL -eq '1') {
         Write-Host 'Internet tunnel did not start. Only the local network link works.' -ForegroundColor Red
     }
+    if ($tgMsg -ne '') { Write-Host ''; Write-Host $tgMsg -ForegroundColor Cyan }
     Write-Host ''
     Write-Host 'Home Wi-Fi links:'
     foreach ($ni in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
@@ -2416,6 +4530,7 @@ try {
     finally {
         if ($cfProc -ne $null) { try { if (-not $cfProc.HasExited) { $cfProc.Kill() } } catch { } }
         if ($natMaps -ne $null) { try { $natMaps.Remove($port, 'TCP') } catch { } }
+        if ($rsMon -ne $null) { try { $rsMon.Stop() } catch { } }
     }
 }
 catch {
